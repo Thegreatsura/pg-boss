@@ -2,13 +2,19 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 
-// `~pro` resolves to the no-op stub in every build of this package, so the
-// overlay-present cases mock the module rather than installing a fixture — the
-// alias is decided once at config load and cannot vary per test.
+// The `~pro` alias is decided once at config load and cannot vary per test, so
+// every case here pins the overlay it means to exercise rather than relying on
+// what the alias happens to resolve to. That matters in both directions: an
+// ordinary build resolves it to the stub, but this suite is also run with a Pro
+// overlay mounted (see pgboss-pro's `npm run build -- --test`), where an
+// unmocked `~pro` is a real overlay with real nav entries and slots.
 function mockOverlay (overlay: unknown) {
   vi.doMock('~pro', () => ({ default: overlay, overlay }))
   vi.resetModules()
 }
+
+/** What `~pro` resolves to in a build with no overlay. */
+const NO_OVERLAY = { nav: [], slots: {} }
 
 function DemoIcon ({ className }: { className?: string }) {
   return <svg className={className} data-testid="demo-icon" />
@@ -46,6 +52,8 @@ describe('pro overlay', () => {
 
   describe('with no overlay', () => {
     it('renders nothing for a slot', async () => {
+      mockOverlay(NO_OVERLAY)
+
       const { ProSlot } = await import('~/components/pro-slot')
       const { container } = render(<ProSlot name="sidebarFooter" />)
 
@@ -53,6 +61,8 @@ describe('pro overlay', () => {
     })
 
     it('leaves the free navigation untouched', async () => {
+      mockOverlay(NO_OVERLAY)
+
       await renderSidebar()
 
       expect(screen.getByText('Overview')).toBeInTheDocument()
