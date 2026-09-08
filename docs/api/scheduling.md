@@ -1,6 +1,6 @@
 # Scheduling
 
-Jobs may be created automatically based on a cron expression. As with other cron-based systems, at least one instance needs to be running for scheduling to work. In order to reduce the amount of evaluations, schedules are checked every 30 seconds, which means the 6-placeholder format should be discouraged in favor of the minute-level precision 5-placeholder format.
+Jobs may be created automatically based on a cron expression or an [RRULE](#rrule-expressions). As with other cron-based systems, at least one instance needs to be running for scheduling to work. In order to reduce the amount of evaluations, schedules are checked every 30 seconds, which means the 6-placeholder format should be discouraged in favor of the minute-level precision 5-placeholder format.
 
 For example, use this format, which implies "any second during 3:30 am every day"
 
@@ -28,14 +28,74 @@ If needed, the default clock monitoring interval can be adjusted using `clockMon
 
 For more cron documentation and examples see the docs for the [cron-parser package](https://www.npmjs.com/package/cron-parser).
 
+## RRULE expressions
+
+An expression carrying a `FREQ=` part, or a line that opens with an iCalendar property such as `DTSTART` or `RRULE`, is read as a recurrence rule as defined in [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545#section-3.3.10) and evaluated by [rrule-temporal](https://www.npmjs.com/package/rrule-temporal). Everything else is a cron expression, which cannot be mistaken for a rule since no cron field contains `=`, `:` or `;`.
+
+Rules cover the schedules cron cannot express: the last Friday of the month, every second Monday, a schedule that stops on a date or after a number of runs.
+
+```js
+// 5pm on the last Friday of the month, Chicago time
+await boss.schedule('report', 'FREQ=MONTHLY;BYDAY=-1FR;BYHOUR=17', null, { tz: 'America/Chicago' })
+```
+
+The expression is either the rule on its own, as above, or the recurrence lines of a calendar entry: a `DTSTART` line, the `RRULE` line, and optional `RDATE` and `EXDATE` lines. Paste those lines rather than a whole export, since a `UID`, a `SUMMARY` or the `BEGIN` and `END` lines around them say nothing about when a job should run and are rejected:
+
+```js
+await boss.schedule('standup', [
+  'DTSTART;TZID=Europe/Berlin:20260901T090000',
+  'RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR',
+  'EXDATE;TZID=Europe/Berlin:20261224T090000'
+].join('\n'))
+```
+
+* **Time zone**
+
+  `DTSTART` decides it when it names one, as `DTSTART;TZID=Europe/Berlin:20260901T090000` does. Otherwise the `tz` option does, so `FREQ=DAILY;BYHOUR=9` with `tz: 'America/Chicago'` runs at nine in Chicago, across daylight saving transitions.
+
+* **DTSTART**
+
+  A rule that carries no `DTSTART` is anchored on 1970-01-01T00:00:00 in the schedule's time zone, the same anchor in every instance and every release. That anchor is what an `INTERVAL` counts from, so `FREQ=HOURLY;INTERVAL=6` runs every six hours from midnight on the epoch. Supply a `DTSTART` to choose the phase yourself. `COUNT` is rejected without one, since counting from the epoch leaves a rule with nothing left to send.
+
+  An `HOURLY`, `MINUTELY` or `SECONDLY` `INTERVAL` counts elapsed time rather than clock time, and the epoch anchor falls in standard time, so in a zone that observes daylight saving the local time of those occurrences moves with the offset: `FREQ=HOURLY;INTERVAL=6` with `tz: 'America/Chicago'` lands on 00:00, 06:00, 12:00 and 18:00 in January and on 01:00, 07:00, 13:00 and 19:00 in July. Name the hours to pin them to the clock instead. `FREQ=DAILY;BYHOUR=0,6,12,18` holds across a transition, as `0 */6 * * *` does.
+
+* **Finite rules**
+
+  `UNTIL` and `COUNT` are honored. Once the last occurrence has passed, the schedule stays in the table and sends nothing further. A rule that has nothing left to send when `schedule()` is called is rejected instead of stored, since a schedule that quietly does nothing is a failure nobody sees.
+
+* **Resolution**
+
+  Schedules are checked every 30 seconds, and a job is filed under the minute its occurrence falls in, so a rule finer than a minute, such as `FREQ=SECONDLY` or a `BYSECOND` list, sends one job for each minute that holds an occurrence. This is the same limitation the 6-placeholder cron format has, and for the same reason. Two occurrences in separate minutes both send, however close together they are: an `RDATE` seconds before one of an hourly rule's own occurrences produces two jobs, not one.
+
+* **Stored format**
+
+  `schedule()` decides which format an expression is in, once, and stores the answer in the schedule table's `kind` column (`cron` or `rrule`); `getSchedules()` returns it. Every pass reads the expression the way that column says, so the format cannot be settled one way at validation and another way later. A row written straight into the table with SQL has to name its own kind, since the column defaults to `cron`, which is what every schedule stored before rules existed is.
+
+  The column is a hint rather than a verdict. When an expression cannot be read the way the column says, and is written the other way, the pass reads it the way it is written and corrects the column. So a row that has lost its label, to a schema rollback and re-upgrade or to an upsert from an instance too old to know the column, keeps firing instead of sitting there looking valid.
+
+A rule is understood by any instance running a release that supports one. During a rolling upgrade an instance still on an older release reads the expression as cron, cannot parse it, and reports an [`invalid_schedule`](./events.md#warning) warning until it is replaced, so rule schedules are best added once the deployment is upgraded.
+
+`schedule()` validates the expression, so a rule that would be read differently than it was meant is rejected before it reaches the table:
+
+* an unknown part such as `BYHOURS=9`, or an unknown property such as `DTSRAT`, which a parser drops before evaluating the rest
+* a value out of range, such as `BYHOUR=25` or the `25` in `BYHOUR=9,25`, which a parser drops just as quietly
+* a part named twice, such as `BYHOUR=9;BYHOUR=17`, where the second replaces the first rather than widening it
+* an expression with no `RRULE` to recur on, such as `DTSTART` and `RDATE` lines on their own
+* a second `DTSTART` or `RRULE`
+* an `RDATE` or `EXDATE` given as a date where `DTSTART` is a date time, which excludes or adds midnight rather than the occurrence it names
+* the combinations RFC 5545 forbids outright, such as `BYMONTHDAY` with a weekly frequency
+* a time zone no evaluation can use, reported in the same words a cron schedule reports it in
+
+## Managing schedules
+
 ### `schedule(name, cron, data, options)`
 
-Schedules a job to be sent to the specified queue based on a cron expression. If the schedule already exists, it's updated to the new cron expression.
+Schedules a job to be sent to the specified queue based on a cron expression or an [RRULE](#rrule-expressions). If the schedule already exists, it's updated to the new expression.
 
 **Arguments**
 
 - `name`: string, *required*
-- `cron`: string, *required*
+- `cron`: string, *required*. A cron expression, or an [RRULE](#rrule-expressions)
 - `data`: object
 - `options`: object
 
@@ -81,11 +141,13 @@ await boss.unschedule('report', 'eu')
 
 Returns all scheduled jobs.
 
+Each schedule carries the expression in `cron`, the format it is in as `kind` (`cron` or `rrule`), the time zone it is evaluated in, and the `data` and `options` its jobs are sent with.
+
 ```js
 const schedules = await boss.getSchedules()
 
 for (const schedule of schedules) {
-  console.log(`${schedule.name} (${schedule.key}): ${schedule.cron} ${schedule.timezone}`)
+  console.log(`${schedule.name} (${schedule.key}): ${schedule.kind} ${schedule.cron} ${schedule.timezone}`)
 }
 ```
 
@@ -95,7 +157,8 @@ Each schedule carries the following properties.
 | --- | --- |
 | `name` | Queue the schedule sends into |
 | `key` | Unique key within the queue, `''` when none was supplied |
-| `cron` | Cron expression |
+| `kind` | Which format `cron` holds, `cron` or `rrule` |
+| `cron` | Cron expression or recurrence rule |
 | `timezone` | Time zone the expression is evaluated in |
 | `data` | Payload sent with each job |
 | `options` | `send()` options applied to each job |
@@ -161,7 +224,9 @@ if (schedule) {
 
 ### `previewSchedule(cron, options)`
 
-Returns the next occurrences a cron expression produces, as an array of `Date`. The expression and
+Returns the next occurrences an expression produces, as an array of `Date`. A cron expression or an
+[RRULE](#rrule-expressions), told apart the same way `schedule()` tells them apart, so a stored
+schedule can be previewed from its `cron` column without consulting its `kind`. The expression and
 time zone are validated exactly as `schedule()` validates them, so anything this previews can also
 be stored.
 
@@ -169,7 +234,7 @@ This is pure computation: it does not query the database and does not require a 
 
 **Arguments**
 
-- `cron`: string, *required*
+- `cron`: string, *required*. A cron expression, or an [RRULE](#rrule-expressions)
 - `options`: object
 
 **options**
@@ -191,14 +256,18 @@ This is pure computation: it does not query the database and does not require a 
 
 * **count**, number, *default: 5*
 
-  How many occurrences to return. Must be an integer between 1 and 1000.
+  How many occurrences to return. Must be an integer between 1 and 1000. A finite rule answers with
+  fewer, and a rule whose last occurrence has passed answers with none: `schedule()` refuses to
+  store one of those, and previewing a stored one is how a caller finds out it has finished.
 
   Occurrences of a sparse expression are expensive to find, and the walk is synchronous, so it also
   gives up after a second rather than hold the event loop for as long as the count would take. Ask
   for fewer and page with `from` if that happens.
 
 ```js
-const occurrences = boss.previewSchedule('0 3 * * *', { tz: 'America/Chicago', count: 3 })
+boss.previewSchedule('0 3 * * *', { tz: 'America/Chicago', count: 3 })
+
+boss.previewSchedule('FREQ=MONTHLY;BYDAY=-1FR;BYHOUR=17', { tz: 'America/Chicago', count: 3 })
 ```
 
 The result describes the expression, not the delivery. Schedules are checked every

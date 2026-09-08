@@ -63,6 +63,22 @@ export const QUEUE_POLICIES = Object.freeze({
   key_strict_fifo: 'key_strict_fifo'
 })
 
+/**
+ * How the expression in a schedule row is read: a cron expression, or an RFC 5545 recurrence rule.
+ *
+ * Stored on the row rather than derived from the expression on every pass, so the format is decided
+ * once, by whoever writes the schedule, and every reader agrees with that decision. A row written
+ * straight into the table with SQL has to name its own kind; the column defaults to cron, which is
+ * what every schedule written before rules existed is.
+ */
+export const SCHEDULE_KINDS = Object.freeze({
+  cron: 'cron',
+  rrule: 'rrule'
+} as const)
+
+/** The kind column's domain, for the CHECK on the table and the migration that adds it. */
+export const SCHEDULE_KIND_CHECK = `kind IN ('${SCHEDULE_KINDS.cron}', '${SCHEDULE_KINDS.rrule}')`
+
 const QUEUE_DEFAULTS = {
   expire_seconds: FIFTEEN_MINUTES,
   retention_seconds: FORTEEN_DAYS,
@@ -219,11 +235,15 @@ function createTableQueue (schema: string) {
   `
 }
 
+// `cron` holds the expression whatever its format, and `kind` says which format that is: the column
+// predates rules and renaming it would break every consumer reading the table, from the dashboard to
+// a hand-written query.
 function createTableSchedule (schema: string) {
   return `
     CREATE TABLE ${schema}.schedule (
       name text REFERENCES ${schema}.queue ON DELETE CASCADE,
       key text not null DEFAULT '',
+      kind text not null DEFAULT '${SCHEDULE_KINDS.cron}' CHECK (${SCHEDULE_KIND_CHECK}),
       cron text not null,
       timezone text,
       data jsonb,
@@ -1073,6 +1093,7 @@ export function deleteAllJobs (schema: string, table: string) {
 const SCHEDULE_COLUMNS = `
   name,
   key,
+  kind,
   cron,
   timezone,
   data,
@@ -1114,11 +1135,28 @@ export function setScheduleLastJobIds (schema: string) {
   `
 }
 
+/**
+ * Relabels the kind of one or more schedules, as the cron pass does when a row's stored kind
+ * disagrees with the expression beside it.
+ *
+ * `updated_on` is deliberately untouched: it tracks edits to the definition, and a relabel is the
+ * pass agreeing with what the row already said, not a change to what the schedule does.
+ */
+export function setScheduleKinds (schema: string) {
+  return `
+    UPDATE ${schema}.schedule s SET kind = k.kind
+    FROM json_to_recordset($1::json) as k (name text, key text, kind text)
+    WHERE s.name = k.name
+      AND COALESCE(s.key, '') = k.key
+  `
+}
+
 export function schedule (schema: string) {
   return `
-    INSERT INTO ${schema}.schedule (name, key, cron, timezone, data, options)
-    VALUES ($1, $2, $3, $4, $5, $6)
+    INSERT INTO ${schema}.schedule (name, key, kind, cron, timezone, data, options)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
     ON CONFLICT (name, key) DO UPDATE SET
+      kind = EXCLUDED.kind,
       cron = EXCLUDED.cron,
       timezone = EXCLUDED.timezone,
       data = EXCLUDED.data,
@@ -1989,6 +2027,14 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
       j.start_after,
       "singletonKey",
       CASE
+        -- A caller that knows the slot names it outright: the cron pass files a rule occurrence in
+        -- the slot the occurrence falls in, and an offset off now() cannot pin that, since now()
+        -- here is insert time. Prefixed because insert() stringifies caller objects straight into
+        -- the recordset below, so an ordinary name would be a live, undeclared and unvalidated
+        -- option on the public path, where a bad value surfaces as a raw postgres error. Not called
+        -- singletonOn either, which is a column fetching a job hands back, so a job read from one
+        -- queue and inserted into another cannot fill it in by accident.
+        WHEN "__singletonSlot" IS NOT NULL THEN CAST("__singletonSlot" as timestamp)
         WHEN "singletonSeconds" IS NOT NULL THEN 'epoch'::timestamp + '1s'::interval * ("singletonSeconds"::float8 * floor(( date_part('epoch', now()) + COALESCE("singletonOffset",0)::float8) / "singletonSeconds"::float8 ))
         ELSE NULL
         END as singleton_on,
@@ -2025,6 +2071,7 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
         "singletonKey" text,
         "singletonSeconds" integer,
         "singletonOffset" integer,
+        "__singletonSlot" text,
         "groupId" text,
         "groupTier" text,
         "expireInSeconds" integer,

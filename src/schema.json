@@ -872,6 +872,13 @@
       },
       {
         "table": "schedule",
+        "column": "kind",
+        "type": "text",
+        "notNull": true,
+        "default": "'cron'::text"
+      },
+      {
+        "table": "schedule",
         "column": "last_job_id",
         "type": "uuid",
         "notNull": false,
@@ -1055,6 +1062,10 @@
       {
         "table": "queue",
         "def": "PRIMARY KEY (name)"
+      },
+      {
+        "table": "schedule",
+        "def": "CHECK ((kind = ANY (ARRAY['cron'::text, 'rrule'::text])))"
       },
       {
         "table": "schedule",
@@ -1830,6 +1841,13 @@
       },
       {
         "table": "schedule",
+        "column": "kind",
+        "type": "text",
+        "notNull": true,
+        "default": "'cron'::text"
+      },
+      {
+        "table": "schedule",
         "column": "last_job_id",
         "type": "uuid",
         "notNull": false,
@@ -2009,6 +2027,10 @@
       {
         "table": "queue",
         "def": "PRIMARY KEY (name)"
+      },
+      {
+        "table": "schedule",
+        "def": "CHECK ((kind = ANY (ARRAY['cron'::text, 'rrule'::text])))"
       },
       {
         "table": "schedule",

@@ -1596,14 +1596,33 @@ function getAll (schema: string, noPartitioning = false, noCovering = false): ty
       release: '12.31.0',
       version: 41,
       previous: 40,
-      // The job each schedule most recently produced, so a schedule can be joined to its last run.
-      // Nullable and unconstrained on purpose: the referenced job is subject to retention and will
-      // eventually be deleted, so a foreign key would either block retention or null the column
-      // back out.
+      // Two columns on the schedule table, in one migration so a database takes one pass over it.
+      //
+      // `kind` says which format the expression in `cron` is in. The default labels every row cron,
+      // which is what a table this migration has never seen holds: cron was the only format a
+      // schedule could be written in. The UPDATE is for the table it has seen before, since
+      // `uninstall` drops the column rather than remembering it, so a rollback to v40 and a
+      // re-upgrade would otherwise relabel every rule as cron from the default and leave a row that
+      // reads fine and never fires. Reading the expression puts the label back. The two patterns
+      // are the detection isRrule() performs, in the terms both postgres and CockroachDB's regexp
+      // engine share: `^` anchors the whole string in one and not the other, so a property on a
+      // line below the first is matched on the whitespace before it instead. No cron expression
+      // matches either, and cannot, since no cron field contains `=`, `:` or `;`.
+      //
+      // `last_job_id` is the job each schedule most recently produced, so a schedule can be joined
+      // to its last run. Nullable and unconstrained on purpose: the referenced job is subject to
+      // retention and will eventually be deleted, so a foreign key would either block retention or
+      // null the column back out.
       install: [
+        `ALTER TABLE ${schema}.schedule ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT '${plans.SCHEDULE_KINDS.cron}' CHECK (${plans.SCHEDULE_KIND_CHECK})`,
+        `UPDATE ${schema}.schedule SET kind = '${plans.SCHEDULE_KINDS.rrule}'
+          WHERE kind = '${plans.SCHEDULE_KINDS.cron}'
+            AND (cron ~* '(^|[[:space:]]|;)FREQ=' OR cron ~* '(^|[[:space:]])(DTSTART|RRULE|RDATE|EXDATE)[;:]')`,
         `ALTER TABLE ${schema}.schedule ADD COLUMN IF NOT EXISTS last_job_id uuid`
       ],
+      // Dropping `kind` drops its CHECK with it, since the constraint belongs to the column.
       uninstall: [
+        `ALTER TABLE ${schema}.schedule DROP COLUMN kind`,
         `ALTER TABLE ${schema}.schedule DROP COLUMN last_job_id`
       ]
     }

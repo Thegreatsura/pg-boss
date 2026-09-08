@@ -15,6 +15,7 @@ import type { JobSpyInterface } from './spy.ts'
 
 export { JOB_STATES as states } from './plans.ts'
 export { QUEUE_POLICIES as policies } from './plans.ts'
+export { SCHEDULE_KINDS as scheduleKinds } from './plans.ts'
 
 export const events: types.Events = Object.freeze({
   error: 'error',
@@ -507,6 +508,10 @@ export class PgBoss extends EventEmitter<types.PgBossEventMap> {
     return this.#contractor.detectDrift()
   }
 
+  /**
+   * Schedules a job on a recurring expression: a cron expression, or an RFC 5545 recurrence rule
+   * such as `FREQ=MONTHLY;BYDAY=-1FR;BYHOUR=17`.
+   */
   schedule (name: string, cron: string, data?: object | null, options?: types.ScheduleOptions): Promise<void> {
     return this.#timekeeper.schedule(name, cron, data, options)
   }
@@ -609,6 +614,7 @@ export type {
   ReindexOptions,
   Request,
   Schedule,
+  ScheduleKind,
   ScheduleOptions,
   SchedulingOptions,
   SchemaDriftReport,

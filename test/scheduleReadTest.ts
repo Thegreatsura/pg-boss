@@ -195,6 +195,59 @@ describe('previewSchedule', function () {
   })
 })
 
+describe('previewSchedule of a recurrence rule', function () {
+  it('should walk a rule the same way it walks a cron expression', function () {
+    const tk = makeTk()
+
+    const occurrences = tk.previewSchedule('FREQ=MONTHLY;BYDAY=-1FR;BYHOUR=17', {
+      tz: 'America/Chicago',
+      from: new Date('2026-03-01T00:00:00Z'),
+      count: 3
+    })
+
+    // the last Friday of the month at 5pm in Chicago, which is what no cron expression can say
+    expect(occurrences.map(d => d.toISOString())).toEqual([
+      '2026-03-27T22:00:00.000Z',
+      '2026-04-24T22:00:00.000Z',
+      '2026-05-29T22:00:00.000Z'
+    ])
+  })
+
+  it('should page a rule on the occurrence handed back', function () {
+    const tk = makeTk()
+
+    const [first] = tk.previewSchedule('FREQ=DAILY;BYHOUR=3', { from: new Date('2026-03-01T03:00:00Z'), count: 1 })
+
+    expect(first.toISOString()).toBe('2026-03-02T03:00:00.000Z')
+
+    const [next] = tk.previewSchedule('FREQ=DAILY;BYHOUR=3', { from: first, count: 1 })
+
+    expect(next.toISOString()).toBe('2026-03-03T03:00:00.000Z')
+  })
+
+  it('should answer a finite rule with what is left of it', function () {
+    const tk = makeTk()
+
+    const from = new Date('2026-03-01T00:00:00Z')
+
+    // COUNT and UNTIL both run out, and fewer occurrences than asked for is the answer rather than
+    // a failure: it is how a caller learns the schedule is nearly done.
+    expect(tk.previewSchedule('DTSTART:20260301T090000Z\nRRULE:FREQ=DAILY;COUNT=3', { from, count: 5 })).toHaveLength(3)
+
+    // and nothing at all, for a rule whose last occurrence has passed. schedule() refuses to store
+    // one of those; previewing an already-stored one has to be able to say so.
+    expect(tk.previewSchedule('DTSTART:20200101T090000Z\nRRULE:FREQ=DAILY;UNTIL=20200201T000000Z', { from })).toEqual([])
+  })
+
+  it('should reject a rule schedule() would reject', function () {
+    const tk = makeTk()
+
+    expect(() => tk.previewSchedule('FREQ=DAILY;BYHOURS=9')).toThrow(/Unsupported part/)
+    expect(() => tk.previewSchedule('FREQ=DAILY;BYHOUR=25')).toThrow(/Unsupported value/)
+    expect(() => tk.previewSchedule('FREQ=DAILY', { tz: 'Mars/Phobos' })).toThrow(/time zone/)
+  })
+})
+
 describe('previewSchedule of a stored schedule', function () {
   it('should agree with the expression the schedule was stored with', async function () {
     ctx.boss = await helper.start({ ...ctx.bossConfig })
@@ -205,6 +258,30 @@ describe('previewSchedule of a stored schedule', function () {
 
     helper.assertTruthy(schedule)
 
+    const occurrences = ctx.boss.previewSchedule(schedule.cron, {
+      tz: schedule.timezone,
+      from: new Date('2026-03-01T00:00:00Z'),
+      count: 2
+    })
+
+    expect(occurrences.map(d => d.toISOString())).toEqual([
+      '2026-03-01T09:00:00.000Z',
+      '2026-03-02T09:00:00.000Z'
+    ])
+  })
+
+  it('should read a stored rule without being told which format it is in', async function () {
+    ctx.boss = await helper.start({ ...ctx.bossConfig })
+
+    await ctx.boss.schedule(ctx.schema, 'FREQ=DAILY;BYHOUR=3', null, { key: 'daily', tz: 'America/Chicago' })
+
+    const schedule = await ctx.boss.getSchedule(ctx.schema, 'daily')
+
+    helper.assertTruthy(schedule)
+    expect(schedule.kind).toBe('rrule')
+
+    // The same two arguments a cron schedule is previewed with: the expression says which format it
+    // is in, the same way schedule() decided when it stored the row.
     const occurrences = ctx.boss.previewSchedule(schedule.cron, {
       tz: schedule.timezone,
       from: new Date('2026-03-01T00:00:00Z'),

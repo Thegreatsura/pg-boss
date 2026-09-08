@@ -705,8 +705,8 @@ describe('timekeeper clock domain', function () {
     // cron() filtered every schedule through one shouldSendIt() call, so this single row silently
     // stopped scheduling for every queue in the whole deployment, on every pass, forever.
     ;(tk as any).getSchedules = async () => ([
-      { name: 'broken', key: '', data: null, options: {}, cron: '* * * * *', timezone: 'Mars/Phobos' },
-      { name: 'healthy', key: '', data: null, options: {}, cron: '* * * * *', timezone: 'UTC' }
+      { name: 'broken', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone: 'Mars/Phobos' },
+      { name: 'healthy', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone: 'UTC' }
     ])
 
     const warnings: any[] = []
@@ -751,7 +751,7 @@ describe('timekeeper clock domain', function () {
     ;(tk as any).stopped = false
     ;(tk as any).manager = { insert: async () => {} }
     ;(tk as any).getSchedules = async () => ([
-      { name: 'broken', key: '', data: null, options: {}, cron: '* * * * *', timezone: 'Mars/Phobos' }
+      { name: 'broken', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone: 'Mars/Phobos' }
     ])
 
     const warnings: any[] = []
@@ -775,7 +775,7 @@ describe('timekeeper clock domain', function () {
 
     let timezone = 'Mars/Phobos'
     ;(tk as any).getSchedules = async () => ([
-      { name: 'broken', key: '', data: null, options: {}, cron: '* * * * *', timezone }
+      { name: 'broken', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone }
     ])
 
     const warnings: any[] = []
@@ -803,7 +803,7 @@ describe('timekeeper clock domain', function () {
 
     let timezone = 'Mars/Phobos'
     ;(tk as any).getSchedules = async () => ([
-      { name: 'broken', key: '', data: null, options: {}, cron: '* * * * *', timezone }
+      { name: 'broken', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone }
     ])
 
     const warnings: any[] = []
@@ -825,7 +825,7 @@ describe('timekeeper clock domain', function () {
     ;(tk as any).stopped = false
     ;(tk as any).manager = { insert: async () => {} }
     ;(tk as any).getSchedules = async () => ([
-      { name: 'broken', key: '', data: null, options: {}, cron: '* * * * *', timezone: 'Mars/Phobos' }
+      { name: 'broken', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone: 'Mars/Phobos' }
     ])
 
     const warnings: any[] = []

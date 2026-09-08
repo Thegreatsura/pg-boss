@@ -245,6 +245,7 @@ export const queueResultSchema = z.object({
 export const scheduleSchema = z.object({
   name: z.string(),
   key: z.string(),
+  kind: z.enum(['cron', 'rrule']),
   cron: z.string(),
   timezone: z.string(),
   data: jsonRecordSchema.optional(),

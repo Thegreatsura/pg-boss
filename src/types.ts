@@ -749,9 +749,11 @@ export interface PreviewScheduleOptions {
    */
   from?: Date;
   /**
-   * How many occurrences to return. Must be an integer between 1 and 1000. A walk that has not
-   * produced them within a second gives up, since occurrences of a sparse expression are expensive
-   * to find and the walk holds the event loop while it runs.
+   * How many occurrences to return. Must be an integer between 1 and 1000. A finite rule answers
+   * with fewer, and one whose last occurrence has passed answers with none.
+   *
+   * A walk that has not produced them within a second gives up, since occurrences of a sparse
+   * expression are expensive to find and the walk holds the event loop while it runs.
    * @default 5
    */
   count?: number;
@@ -954,9 +956,15 @@ export interface Request {
   options?: SendOptions;
 }
 
+/** Which format a schedule's expression is in. */
+export type ScheduleKind = 'cron' | 'rrule'
+
 export interface Schedule {
   name: string;
   key: string;
+  /** Which of the two formats `cron` holds, decided by `schedule()` and stored on the row. */
+  kind: ScheduleKind;
+  /** The cron expression or recurrence rule this schedule recurs on. */
   cron: string;
   timezone: string;
   data?: object;

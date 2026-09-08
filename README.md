@@ -46,7 +46,7 @@ This will likely cater the most to teams already familiar with the simplicity of
 * Create jobs in an existing db transaction, including adapters for popular ORMs such as Drizzle, Knex, Kysely, Prisma
 * Backpressure-compatible polling workers, including support for LISTEN/NOTIFY low latency delivery
 * Job dependency workflow orchestration
-* Cron scheduling, job deferral
+* Cron and RRULE scheduling, job deferral
 * Queue storage policies to support a variety of rate limiting, debouncing, and concurrency use cases
 * Priority queues, dead letter queues with redrive, automatic retries with exponential backoff
 * Pub/sub API for fan-out queue relationships
