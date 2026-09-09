@@ -1,0 +1,12 @@
+{
+  // test/bun runs under the Bun runtime, so it needs Bun's globals and `bun`/`bun:test` modules,
+  // which the root config deliberately does not load: they would be in scope for src and the
+  // vitest suite too. `bun test` does not type-check, so without this config the only suite that
+  // exercises the real driver would have no type checking at all.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["bun"]
+  },
+  "include": ["src", "test/bun"],
+  "exclude": []
+}

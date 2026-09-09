@@ -17,6 +17,10 @@ const schema = 'bun_conformance_' + Math.random().toString(36).slice(2, 10)
 const client = new SQL(connectionString)
 const db = fromBunSql(client)
 
+// sql.listen() arrived in Bun 1.4.0; the suite still has to pass on an older runtime, where the
+// method the types promise is simply absent
+const hasListen = typeof client.listen === 'function'
+
 let boss: PgBoss
 
 beforeAll(async () => {
@@ -64,7 +68,7 @@ describe('pg-boss on Bun.SQL', () => {
     const ids = [await boss.send(queue, {}), await boss.send(queue, {})] as string[]
     await boss.fetch(queue, { batchSize: 2 })
 
-    const result = await boss.complete(queue, ids, {}, { batch: true })
+    const result = await boss.complete(queue, ids, {})
     expect(result.affected).toBe(2)
   })
 
@@ -109,7 +113,7 @@ describe('pg-boss on Bun.SQL', () => {
     const queue = 'worked'
     await boss.createQueue(queue)
 
-    const { promise, resolve } = Promise.withResolvers<any>()
+    const { promise, resolve } = Promise.withResolvers<unknown>()
     await boss.work(queue, async ([job]) => resolve(job.data))
     await boss.send(queue, { via: 'worker' })
 
@@ -132,6 +136,39 @@ describe('pg-boss on Bun.SQL', () => {
 
     const { rows } = await db.executeSql(`SELECT cron_on FROM ${schema}.version`)
     expect(rows[0].cron_on).toBeTruthy()
+  })
+
+  // A local run on an older Bun legitimately skips the test below, but CI installs the latest, so a
+  // skip there would silently drop the only real-runtime proof that the listener works.
+  test.if(!!process.env.CI)('runs on a Bun with sql.listen()', () => {
+    expect(hasListen).toBe(true)
+  })
+
+  // sql.listen() arrived in Bun 1.4.0 (oven-sh/bun#32089). On an older runtime the adapter exposes
+  // no listen at all and pg-boss polls, which is covered in test/bunAdapterTest.ts.
+  test.skipIf(!hasListen)('delivers a job through LISTEN/NOTIFY', async () => {
+    const queue = 'notified'
+
+    // a second boss so useListenNotify and the queue's notify option are on for this test only
+    const listening = new PgBoss({ db, schema, useListenNotify: true })
+    listening.on('error', () => {})
+    await listening.start()
+
+    try {
+      await listening.createQueue(queue, { notify: true })
+
+      const { promise, resolve } = Promise.withResolvers<unknown>()
+      // Both polling intervals are well past the test's patience, and neither burst trigger is on,
+      // so a delivery inside the test's lifetime can only have come from the NOTIFY.
+      const poll = { pollingIntervalSeconds: 30, notifyPollingIntervalSeconds: 30 }
+      await listening.work(queue, poll, async ([job]) => resolve(job.data))
+
+      await listening.send(queue, { woken: 'by notify' })
+
+      expect(await promise).toEqual({ woken: 'by notify' })
+    } finally {
+      await listening.stop({ graceful: false }).catch(() => {})
+    }
   })
 
   test('surfaces a SQLSTATE where pg-boss reads it', async () => {

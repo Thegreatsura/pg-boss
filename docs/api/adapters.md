@@ -38,7 +38,7 @@ await db.transaction().execute(async (trx) => {
 
 ## Drizzle
 
-The Drizzle adapter requires the `sql` tagged-template function from `drizzle-orm` as a second argument. This allows pg-boss to construct parameterised queries through Drizzle's public API without adding `drizzle-orm` as a runtime dependency. The `node-postgres`, `postgres-js` and `bun-sql` drivers are supported.
+The Drizzle adapter requires the `sql` tagged-template function from `drizzle-orm` as a second argument. This allows pg-boss to construct parameterised queries through Drizzle's public API without adding `drizzle-orm` as a runtime dependency. The `node-postgres`, `postgres-js` and `bun-sql` drivers are supported — for `bun-sql`, see [Bun](../database-backends.md#bun-driver), which covers running pg-boss on Bun's client as well as enqueueing through it.
 
 ```ts
 import { fromDrizzle } from 'pg-boss'
@@ -50,12 +50,6 @@ await db.transaction(async (tx) => {
   await boss.send('order-processing', { item: 'widget' }, { db: fromDrizzle(tx, sql) })
 })
 ```
-
-### Bun
-
-`bun-sql` works through the same adapter, which absorbs two Bun-specific encoding limits: it cannot serialize a JS array as a Postgres array parameter ([oven-sh/bun#18775](https://github.com/oven-sh/bun/issues/18775)), and it infers a bind parameter's type from the cast in front of it ([oven-sh/bun#28819](https://github.com/oven-sh/bun/issues/28819)).
-
-To run pg-boss itself on `Bun.SQL` rather than only enqueue through it, see [`fromBunSql`](../database-backends.md#bun-driver) — the bundled `pg` driver also works under the Bun runtime, so a connection string remains the simplest option.
 
 ## Prisma
 

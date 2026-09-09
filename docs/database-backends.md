@@ -64,8 +64,8 @@ leave `useListenNotify` disabled and avoid the queue `notify` option; pg-boss de
 `fromPglite` adapter wires it up automatically, so `useListenNotify` works with no extra setup.
 
 Bun's `Bun.SQL` client has no row of its own: it is a different *driver* against PostgreSQL, not a
-different database, so it runs on the `postgres` profile with every feature above except
-LISTEN/NOTIFY, which the client does not expose. See [Bun](#bun-driver).
+different database, so it runs on the `postgres` profile with every feature above — LISTEN/NOTIFY
+included, on Bun 1.4.0 and later. See [Bun](#bun-driver).
 
 ## Compatibility flags
 
@@ -369,14 +369,18 @@ schema and data persist wherever the PGlite instance stores its data directory.
 
 [Bun](https://bun.sh) ships its own PostgreSQL client, `Bun.SQL`. It talks to an ordinary PostgreSQL
 server, so this is not a backend profile — the default `postgres` profile applies and every feature
-works. It is a different *driver*, reached through the `fromBunSql` adapter instead of the `pg`
-connection pool.
+works. It is a different *driver*, reached through an adapter instead of the `pg` connection pool.
 
 You do not need it to run pg-boss on Bun: the bundled `pg` driver works under the Bun runtime, and a
-connection string is the simpler choice. Use the adapter when you want one client, and one pool,
-shared between pg-boss and the rest of your Bun application.
+connection string is the simpler choice. Reach for an adapter when you want one client, and one
+pool, shared between pg-boss and the rest of your Bun application.
 
-#### Usage
+| What you want | Use |
+|---|---|
+| pg-boss to run on your Bun client | `fromBunSql(sql)` as the constructor `db` |
+| To enqueue inside a Drizzle transaction on `bun-sql` | [`fromDrizzle(tx, sql)`](api/adapters.md#drizzle) as the per-call `db` |
+
+#### Running pg-boss on Bun.SQL
 
 ```ts
 import { SQL } from 'bun'
@@ -394,28 +398,61 @@ await boss.send('email', { to: 'user@example.com' })
 
 As with PGlite, the client is yours: pg-boss never calls `end()` on it.
 
-#### What the adapter absorbs
+#### Enqueueing inside a transaction
 
-Two `Bun.SQL` behaviours differ from `pg` in ways pg-boss would otherwise trip over, and the adapter
-handles both — they are listed here because they explain the shape of the queries you will see in
-`pg_stat_statements`, not because you need to do anything about them.
+The `db` option on `send()`, `insert()`, `complete()` and friends takes anything implementing
+`executeSql`, so job writes can join a transaction you already own. On Drizzle over `bun-sql` that
+is the [Drizzle adapter](api/adapters.md#drizzle), unchanged from any other driver:
+
+```ts
+import { drizzle } from 'drizzle-orm/bun-sql'
+import { sql } from 'drizzle-orm'
+import { fromDrizzle } from 'pg-boss'
+
+await db.transaction(async (tx) => {
+  await tx.insert(orders).values({ item: 'widget', qty: 1 })
+
+  await boss.send('order-processing', { item: 'widget' }, { db: fromDrizzle(tx, sql) })
+})
+```
+
+Without Drizzle, wrap a `sql.begin()` transaction the same way `fromBunSql` wraps the client.
+
+#### What the adapters absorb
+
+Three `Bun.SQL` behaviours differ from `pg` in ways pg-boss would otherwise trip over. The adapters
+handle them; nothing is asked of you. They are listed because the first explains the shape of the
+queries you will see in `pg_stat_statements`, and because the first two are upstream bugs that may
+be fixed out from under this note.
 
 - **Array parameters.** Bun cannot encode a JS array as a PostgreSQL array parameter; it stringifies
   it, and every `= ANY($n::uuid[])` fails with `malformed array literal`
-  ([oven-sh/bun#18775](https://github.com/oven-sh/bun/issues/18775)). The adapter expands an
+  ([oven-sh/bun#18775](https://github.com/oven-sh/bun/issues/18775)). Both adapters expand an
   array-cast parameter into `ARRAY[$2,$3]` of scalar parameters, so bind count varies with the
   number of ids in a `complete()` or `cancel()` call.
-- **Transaction scripts.** pg-boss installs its schema, migrates, and runs maintenance as
-  `BEGIN; ... COMMIT;` scripts. Bun refuses those on a pooled connection (`Only use sql.begin,
-  sql.reserved or max: 1`), so the adapter reserves a connection for the duration of one.
+- **Parameter type inference.** Bun infers a bind parameter's type from the cast in front of it, so
+  `$n::json` re-encodes an already-serialized payload
+  ([oven-sh/bun#28819](https://github.com/oven-sh/bun/issues/28819)). pg-boss routes those casts
+  through `::text::json` for every driver, so this one is handled in the SQL rather than an adapter.
+- **Error codes.** Bun reports every server error as `ERR_POSTGRES_SERVER_ERROR` and puts the
+  SQLSTATE in `errno`, where `pg` puts it in `code`. `fromBunSql` moves it onto `code`, which is
+  where pg-boss reads it to tell a lost fetch race from a real failure.
 
-#### Limitations
+Transaction handling differs too, though it is invisible from the outside: pg-boss installs its
+schema, migrates, and runs maintenance as `BEGIN; ... COMMIT;` scripts, and Bun refuses those on a
+pooled connection (`Only use sql.begin, sql.reserved or max: 1`). `fromBunSql` reserves a connection
+for the duration of one.
 
-- **No `useListenNotify`.** `Bun.SQL` exposes no LISTEN, so pg-boss polls. Everything else —
-  workers, scheduling, maintenance, flows — behaves as it does on `pg`.
-- **Transactional job creation.** The `db` option on `send()`/`insert()` takes anything implementing
-  `executeSql`, so a `sql.begin()` transaction can be wrapped the same way `fromBunSql` wraps the
-  client. For Drizzle users on `bun-sql`, [`fromDrizzle`](api/adapters.md#drizzle) already covers it.
+#### LISTEN/NOTIFY
+
+`useListenNotify` works on **Bun 1.4.0 and later**, which is where `sql.listen()` arrived
+([oven-sh/bun#32089](https://github.com/oven-sh/bun/pull/32089)). Bun reconnects and re-subscribes on
+its own, and reports each subscribe through the callback pg-boss uses to close the gap, so a
+notification missed while the listener was down is recovered by the next fetch.
+
+On an earlier Bun the adapter exposes no listener at all, and pg-boss emits a
+`listen_notify_unavailable` warning and delivers by polling — the default, and never more than a
+latency difference.
 
 ### Not supported: Aurora DSQL
 

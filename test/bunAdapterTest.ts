@@ -140,6 +140,39 @@ describe('bun adapter', () => {
     await expect(fromBunSql(client).executeSql('SELECT 1')).rejects.toMatchObject({ code: '23505' })
   })
 
+  it('exposes listen when the client has it, and closes the subscription', async () => {
+    const { client } = fakeBunSql()
+    let unlistened = false
+    const subscribed: unknown[] = []
+
+    const listening = {
+      ...client,
+      async listen (channel: string, onNotification: (payload: string) => void, onSubscribe?: () => void) {
+        subscribed.push(channel, onNotification, onSubscribe)
+        return { unlisten: () => { unlistened = true } }
+      }
+    } satisfies BunSqlLike
+
+    const onNotification = () => {}
+    const onReconnect = () => {}
+
+    const handle = await fromBunSql(listening).listen!('pgboss', onNotification, onReconnect)
+
+    // Bun's third argument fires on the initial subscribe and after each reconnect, which is what
+    // pg-boss's onReconnect expects, so it is passed straight through
+    expect(subscribed).toEqual(['pgboss', onNotification, onReconnect])
+
+    await handle.close()
+    expect(unlistened).toBe(true)
+  })
+
+  it('omits listen when the client has none, so the notifier falls back to polling', async () => {
+    // sql.listen() arrived in Bun 1.4.0; on an older runtime pg-boss must see no capability at all
+    const { client } = fakeBunSql()
+
+    expect(fromBunSql(client).listen).toBeUndefined()
+  })
+
   it('leaves a non-server error alone', async () => {
     const { client } = fakeBunSql(() => {
       throw Object.assign(new Error('connection closed'), { code: 'ERR_POSTGRES_CONNECTION_CLOSED' })

@@ -7,6 +7,16 @@ import { expandArrayParams } from './placeholders.ts'
 export interface BunSqlLike {
   unsafe(text: string, values?: unknown[]): Promise<unknown>
   reserve(): Promise<BunReservedSqlLike>
+  // Added in Bun 1.4.0 (oven-sh/bun#32089); absent on older runtimes, hence optional.
+  listen?(
+    channel: string,
+    onNotification: (payload: string) => void,
+    onSubscribe?: () => void
+  ): Promise<BunSubscriptionLike>
+}
+
+export interface BunSubscriptionLike {
+  unlisten(): Promise<void> | void
 }
 
 export interface BunReservedSqlLike {
@@ -42,11 +52,11 @@ const BUN_SERVER_ERROR = 'ERR_POSTGRES_SERVER_ERROR'
  *
  * The caller owns the client's lifecycle: pg-boss never calls `end()` on it.
  *
- * Bun's client exposes no LISTEN, so this adapter implements no `listen` and pg-boss falls back to
- * polling. `useListenNotify` is not available on Bun.
+ * `useListenNotify` needs `sql.listen()`, which Bun added in 1.4.0. On an older runtime the adapter
+ * exposes no `listen` and pg-boss falls back to polling.
  */
 export function fromBunSql (client: BunSqlLike): IDatabase {
-  return {
+  const db: IDatabase = {
     async executeSql (text: string, values?: unknown[]) {
       const query = expandArrayParams(text, values)
 
@@ -63,6 +73,21 @@ export function fromBunSql (client: BunSqlLike): IDatabase {
       }
     }
   }
+
+  // Bun's third argument fires on the initial subscribe and again after each reconnect - it
+  // re-establishes the connection and re-subscribes every channel on its own - which is exactly
+  // what pg-boss's onReconnect is for: a notification sent while the listener was down is gone,
+  // so the gap has to be closed by a fetch. Only expose `listen` when the client actually has it
+  // (Bun < 1.4.0, or a mock), so the notifier cleanly falls back to polling otherwise.
+  if (typeof client.listen === 'function') {
+    db.listen = async (channel, onNotification, onReconnect) => {
+      const subscription = await client.listen!(channel, onNotification, onReconnect)
+
+      return { close: async () => { await subscription.unlisten() } }
+    }
+  }
+
+  return db
 }
 
 async function runReserved (client: BunSqlLike, run: (target: BunReservedSqlLike) => Promise<unknown>) {
