@@ -256,7 +256,6 @@ Warnings correlate to [`warning`](./api/events.md#warning) events already emitte
 - `clock_skew`: Database clock drift detection
 - `listen_notify_unavailable`: `useListenNotify` is on but no listener could be established
 - `invalid_schedule`: A stored schedule could not be evaluated and was skipped
-- `missed_occurrences_capped`: A schedule catching up on an outage came due more times than one cron pass sends for it
 - `index_bloat`: A job index holds far more pages than its live entries need and was not rebuilt
 - `xmin_horizon`: Something is pinning the MVCC horizon, so vacuum reclaims nothing
 - `autovacuum_disabled`: Nothing is vacuuming a job table at all

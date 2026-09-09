@@ -149,24 +149,6 @@ describe('schedule missed', function () {
     // The most recent one, which for a schedule whose job reads the current state of the world is
     // the only one worth running.
     expect(slots(inserted)).toEqual([slotOf(minute - MINUTE)])
-  })
-
-  it('sends a job for every missed occurrence under all', async function () {
-    const tk = makeTk()
-
-    const minute = Math.floor(Date.now() / MINUTE) * MINUTE
-    const now = minute + 30_000
-
-    const inserted = await pass(tk, now, new Date(now - 5 * MINUTE), [row('* * * * *', 'all')])
-
-    // The four boundaries between the last pass and the due window, oldest first, each in the slot
-    // it fell in rather than the one the pass is running in.
-    expect(slots(inserted)).toEqual([
-      slotOf(minute - 4 * MINUTE),
-      slotOf(minute - 3 * MINUTE),
-      slotOf(minute - 2 * MINUTE),
-      slotOf(minute - MINUTE)
-    ])
 
     // and the occurrence in the due window is still filed the way it always was
     expect(inserted[inserted.length - 1].singletonSeconds).toBe(60)
@@ -179,28 +161,27 @@ describe('schedule missed', function () {
     const now = minute + 30_000
 
     const inserted = await pass(tk, now, new Date(now - 3 * MINUTE), [
-      row('FREQ=MINUTELY', 'all', { kind: plans.SCHEDULE_KINDS.rrule })
+      row('FREQ=MINUTELY', 'once', { kind: plans.SCHEDULE_KINDS.rrule })
     ])
 
-    // Both formats catch up on the same range: the two boundaries in the gap, then the due one,
-    // which a rule files in its own slot rather than the insert's.
+    // Both formats catch up on the same range: the newest occurrence the gap held, then the due
+    // one, which a rule files in its own slot rather than the insert's.
     expect(slots(inserted)).toEqual([
-      slotOf(minute - 2 * MINUTE),
       slotOf(minute - MINUTE),
       slotOf(minute)
     ])
   })
 
-  it('catches up on every occurrence of a rule carrying an RDATE', async function () {
+  it('catches up on a rule carrying an RDATE', async function () {
     const tk = makeTk()
 
     const minute = Math.floor(Date.now() / MINUTE) * MINUTE
     const now = minute + 30_000
 
     // A calendar export pairs a rule with one-off dates, and an RDATE is an absolute instant rather
-    // than a phase of the rule: read backwards through rrule-temporal's previous() the walk jumped
-    // to the RDATE and resumed from there, so every regular occurrence between the cursor and the
-    // RDATE was dropped. Read in chunks of between(), the catch-up sees what the due window sees.
+    // than a phase of the rule: read backwards through rrule-temporal's previous() the walk jumps
+    // to the RDATE and resumes from there, which answers with the RDATE in place of the occurrence
+    // that follows it. Read through between(), the catch-up sees what the due window sees.
     const cron = [
       `DTSTART:${ical(minute - 10 * MINUTE)}`,
       'RRULE:FREQ=MINUTELY',
@@ -208,18 +189,41 @@ describe('schedule missed', function () {
     ].join('\n')
 
     const inserted = await pass(tk, now, new Date(now - 5 * MINUTE), [
-      row(cron, 'all', { kind: plans.SCHEDULE_KINDS.rrule })
+      row(cron, 'once', { kind: plans.SCHEDULE_KINDS.rrule })
     ])
 
-    // Every minute the gap held, plus the due one. The RDATE shares the slot of the occurrence it
-    // sits beside, so it collapses into that job rather than adding one.
+    // The last minute the gap held rather than the RDATE two minutes behind it, and the due one.
     expect(slots(inserted)).toEqual([
-      slotOf(minute - 4 * MINUTE),
-      slotOf(minute - 3 * MINUTE),
-      slotOf(minute - 2 * MINUTE),
       slotOf(minute - MINUTE),
       slotOf(minute)
     ])
+  })
+
+  it('catches up on a rule that stopped recurring partway through the gap', async function () {
+    const tk = makeTk()
+
+    const minute = Math.floor(Date.now() / MINUTE) * MINUTE
+    const now = minute + 30_000
+
+    // The backwards read widens its steps to reach a sparse expression over a long gap, and a rule
+    // that is empty near the window and dense behind it defeats that guess: the steps over the
+    // empty stretch grow until one spans more occurrences than rrule-temporal generates in a single
+    // call, and it throws rather than truncating. A per-minute rule whose UNTIL passed three days
+    // before the gap opened is that shape, and the whole catch-up was lost to the warning.
+    const cron = [
+      `DTSTART:${ical(minute - 400 * DAY)}`,
+      `RRULE:FREQ=MINUTELY;UNTIL=${ical(minute - 3 * DAY)}`
+    ].join('\n')
+
+    const warnings: any[] = []
+    tk.on('warning', warning => warnings.push(warning))
+
+    const inserted = await pass(tk, now, new Date(now - 30 * DAY), [
+      row(cron, 'once', { kind: plans.SCHEDULE_KINDS.rrule, createdOn: new Date(minute - 400 * DAY) })
+    ])
+
+    expect(warnings).toEqual([])
+    expect(slots(inserted)).toEqual([slotOf(minute - 3 * DAY)])
   })
 
   it('sends nothing when the last pass is inside the due window', async function () {
@@ -230,7 +234,7 @@ describe('schedule missed', function () {
     // 45 at the ceiling, and the window is 60 wide, so there is never a gap between them to catch
     // up on and the policy costs nothing.
     for (const seconds of [1, 30, 45, 60]) {
-      const inserted = await pass(tk, now, new Date(now - seconds * 1000), [row('* * * * * *', 'all')])
+      const inserted = await pass(tk, now, new Date(now - seconds * 1000), [row('* * * * * *', 'once')])
 
       expect(slots(inserted)).toEqual([])
     }
@@ -242,13 +246,14 @@ describe('schedule missed', function () {
     const minute = Math.floor(Date.now() / MINUTE) * MINUTE
     const now = minute + 30_000
 
-    // A schedule written during the gap, by a process that was up while nothing ran a pass. The
-    // occurrences before it are of an expression that was not in the table yet.
+    // A schedule written during the gap, by a process that was up while nothing ran a pass. An
+    // occurrence before it is of an expression that was not in the table yet, so a daily schedule
+    // two minutes old owes nothing for the ten the gap held.
     const inserted = await pass(tk, now, new Date(now - 10 * MINUTE), [
-      row('* * * * *', 'all', { createdOn: new Date(minute - 2 * MINUTE - 30_000) })
+      row(DAILY, 'once', { createdOn: new Date(minute - 2 * MINUTE - 30_000) })
     ])
 
-    expect(slots(inserted)).toEqual([slotOf(minute - 2 * MINUTE), slotOf(minute - MINUTE)])
+    expect(slots(inserted)).toEqual([])
   })
 
   it('reads a policy it does not recognize as skip', async function () {
@@ -257,7 +262,7 @@ describe('schedule missed', function () {
 
     // A row written straight into the table with SQL, or by a release naming a policy this one does
     // not: the pass sends what it has always sent rather than picking a policy on the row's behalf.
-    const inserted = await pass(tk, now, new Date(now - 10 * MINUTE), [row('* * * * *', 'hourly-ish')])
+    const inserted = await pass(tk, now, new Date(now - 10 * MINUTE), [row('* * * * *', 'all')])
 
     expect(slots(inserted)).toEqual([])
   })
@@ -274,57 +279,17 @@ describe('schedule missed', function () {
     const cron = `DTSTART:${ical(bound)}\nRRULE:FREQ=SECONDLY;COUNT=2`
 
     const inserted = await pass(tk, now, new Date(now - 10 * MINUTE), [
-      row(cron, 'all', { kind: plans.SCHEDULE_KINDS.rrule })
+      row(cron, 'once', { kind: plans.SCHEDULE_KINDS.rrule })
     ])
 
     expect(slots(inserted)).toEqual([slotOf(bound)])
-  })
-
-  it('caps a backlog under all and warns that it did', async function () {
-    const tk = makeTk()
-
-    const warnings: any[] = []
-    tk.on('warning', warning => warnings.push(warning))
-
-    const minute = Math.floor(Date.now() / MINUTE) * MINUTE
-    const now = minute + 30_000
-
-    // Two thousand minutes down, which is more than one pass sends for one schedule.
-    const inserted = await pass(tk, now, new Date(now - 2000 * MINUTE), [row('* * * * *', 'all')])
-
-    const filed = slots(inserted)
-
-    expect(filed).toHaveLength(1000)
-
-    // The recent end of the backlog is the part kept: a schedule catching up on a day and a half
-    // has a day and a half of work behind it either way.
-    expect(filed[filed.length - 1]).toBe(slotOf(minute - MINUTE))
-    expect(filed[0]).toBe(slotOf(minute - 1000 * MINUTE))
-
-    expect(warnings).toHaveLength(1)
-    expect(warnings[0].message).toMatch(/came due more than 1000 times/)
-    expect(warnings[0].data).toMatchObject({ queue: 'q', key: '', limit: 1000 })
-  })
-
-  it('does not warn when once collapses a backlog, which is what it is for', async function () {
-    const tk = makeTk()
-
-    const warnings: any[] = []
-    tk.on('warning', warning => warnings.push(warning))
-
-    const now = Date.now()
-
-    const inserted = await pass(tk, now, new Date(now - 2000 * MINUTE), [row('* * * * *', 'once')])
-
-    expect(slots(inserted)).toHaveLength(1)
-    expect(warnings).toEqual([])
   })
 
   it('rejects a policy no pass would honor', async function () {
     const tk = makeTk()
 
     await expect(tk.schedule('q', DAILY, null, { missed: 'sometimes' } as any))
-      .rejects.toThrow(/missed must be one of: skip, once, all/)
+      .rejects.toThrow(/missed must be one of: skip, once/)
   })
 
   it('reads a nullish policy as none given, the way a falsy time zone is read', async function () {
@@ -344,11 +309,11 @@ describe('schedule missed', function () {
   it('stores the policy on the schedule and reads it back', async function () {
     ctx.boss = await helper.start({ ...ctx.bossConfig, schedule: false })
 
-    await ctx.boss.schedule(ctx.schema, DAILY, null, { missed: 'all' })
+    await ctx.boss.schedule(ctx.schema, DAILY, null, { missed: 'once' })
 
     const schedule = await ctx.boss.getSchedule(ctx.schema)
 
-    expect(schedule!.options).toMatchObject({ missed: 'all' })
+    expect(schedule!.options).toMatchObject({ missed: 'once' })
   })
 
   it('answers the cron claim with the timestamp it replaced', async function () {
@@ -383,33 +348,6 @@ describe('schedule missed', function () {
     }
   })
 
-  it('sends the occurrences an outage held', async function () {
-    ctx.boss = await helper.start(firingConfig())
-
-    await ctx.boss.schedule(ctx.schema, DAILY, null, { missed: 'all' })
-
-    const gapStart = new Date(Date.now() - 3 * DAY)
-
-    await openGap(gapStart)
-
-    // What the gap held, computed the way a caller would: the occurrences after it that are already
-    // older than the 60-second due window.
-    const expected = ctx.boss.previewSchedule(DAILY, { from: gapStart, count: 10 })
-      .filter(occurrence => occurrence.getTime() <= Date.now() - MINUTE)
-
-    expect(expected.length).toBeGreaterThan(1)
-
-    const jobs = await waitForJobs(ctx.boss, expected.length)
-
-    expect(jobs).toHaveLength(expected.length)
-
-    // A pass a second later has no gap left to read, so the backlog is sent once rather than again
-    // on every pass.
-    await delay(2_000)
-
-    expect(await ctx.boss.fetch(ctx.schema, { batchSize: 100 })).toEqual([])
-  })
-
   it('sends one job for an outage under once', async function () {
     ctx.boss = await helper.start(firingConfig())
 
@@ -440,7 +378,7 @@ describe('schedule missed', function () {
     expect(await ctx.boss.fetch(ctx.schema, { batchSize: 100 })).toEqual([])
   })
 
-  it('records the newest occurrence of a catch-up batch as the last job', async function () {
+  it('records the later occurrence of a catch-up pair as the last job', async function () {
     const tk = makeTk()
 
     const sent: string[] = []
@@ -457,16 +395,20 @@ describe('schedule missed', function () {
 
     const minute = Math.floor(Date.now() / MINUTE) * MINUTE
 
-    // One schedule, three occurrences, in an order no fetch promises to avoid: a catch-up creates
-    // every job in a single insert, so they share a created_on and come back however they come back.
-    const batch = [minute - MINUTE, minute - 3 * MINUTE, minute - 2 * MINUTE]
-      .map(instant => ({ data: { name: 'q', key: '', slot: slotOf(instant) } }))
+    // A catch-up occurrence and the one due now, which a pass creates in a single insert, so they
+    // share a created_on and come back from the fetch in an order nothing promises. The due job of
+    // a cron schedule names no slot, since the insert files it from its own clock, and that clock
+    // is later than every slot a catch-up occurrence can name.
+    const batch = [
+      { data: { name: 'q', key: '' } },
+      { data: { name: 'q', key: '', slot: slotOf(minute - 3 * MINUTE) } }
+    ]
 
     await (tk as any).onSendIt(batch)
 
     const [{ params }] = tk.executed.filter(({ sql }) => sql.includes('last_job_id'))
 
-    // The job of the newest occurrence, rather than whichever settled last.
+    // The job of the newer occurrence, rather than whichever settled last.
     expect(JSON.parse(params[0] as string)).toEqual([{ name: 'q', key: '', jobId: 'job-0' }])
   })
 })

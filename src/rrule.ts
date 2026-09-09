@@ -332,53 +332,76 @@ function toDate (occurrence: { epochMilliseconds: number }): Date {
 }
 
 /**
- * How wide the first backwards chunk of a catch-up read is, and the factor each one after it grows
- * by. An hour fills the cap outright for anything denser than a job a second, and four steps of
- * growth reach a month, so a sparse expression over a long outage is read in a handful of calls.
+ * How wide the first backwards step of a catch-up read is, and the factor each one after it grows
+ * by. An hour is the floor because no rule recurs more often than once a second, so a step that
+ * narrow can never hold more than 3600 occurrences; four steps of growth reach a month, so a sparse
+ * expression over a long outage is found in a handful of reads.
  */
-const CHUNK_SECONDS = 60 * 60
-const CHUNK_GROWTH = 4
+const STEP_SECONDS = 60 * 60
+const STEP_GROWTH = 4
 
 /**
- * The occurrences in `after` to `until`, the lower bound excluded and the upper included, newest
- * first and at most `limit` of them.
+ * The most recent occurrence in `after` to `until`, the lower bound excluded and the upper
+ * included, or null when the range holds none.
  *
- * Read in chunks that widen backwards from `until` rather than in one between() over the whole
+ * Read in steps that widen backwards from `until` rather than in one between() over the whole
  * range, because the range a catch-up reads is as wide as the gap it covers: a single between()
  * over three weeks of a per-second rule materializes every occurrence in those three weeks to hand
- * back the few the caller will use. A dense expression fills the limit out of the first chunk, and
- * a sparse one reaches `after` in a few steps, since each chunk is four times the last. Either way
- * the walk costs what it returns rather than what the gap spans.
+ * back the one the caller will use. A dense expression answers out of the first step, and a sparse
+ * one reaches `after` in a few more, since each step is four times the last.
+ *
+ * Widening is a guess about density, and a rule that is empty near `until` and dense further back
+ * defeats it: the steps over the empty stretch grow until one spans more occurrences than
+ * rrule-temporal will generate in a single call, and it throws rather than truncating. A per-minute
+ * rule whose UNTIL passed a few days before the gap opened is that shape, and an ordinary one. So a
+ * step that overruns is halved and read again, and the width it overran at becomes a ceiling no
+ * later step goes back over. A step at the floor that still overruns is the expression rather than
+ * the width, and the caller hears about it instead.
  *
  * Deliberately not rrule-temporal's previous(). That walks backwards from a phase-aligned DTSTART,
  * and an RDATE is an absolute instant rather than a phase, so a rule carrying one answers with the
  * RDATE in place of the rule occurrence that follows it and loses every occurrence in between.
  * between() has no such problem, and it is what the due window has always read.
  */
-export function occurrencesBefore (expression: string, after: Date, until: Date, tz: string, limit: number): Date[] {
+export function latestOccurrenceBefore (expression: string, after: Date, until: Date, tz: string): Date | null {
   const rule = cachedRule(expression, tz)
-  const occurrences: Date[] = []
+  const floor = STEP_SECONDS * 1000
+  const start = after.getTime()
 
-  let upper = until
-  let width = CHUNK_SECONDS * 1000
+  let upper = until.getTime()
+  let width = floor
+  let ceiling = Number.POSITIVE_INFINITY
 
-  while (occurrences.length < limit && upper.getTime() > after.getTime()) {
-    const lower = new Date(Math.max(after.getTime(), upper.getTime() - width))
+  while (upper > start) {
+    const lower = Math.max(start, upper - width)
 
-    // between() excludes both ends. The upper bound is nudged past so an occurrence on it is
-    // included, and the lower one stays excluded because it is the next chunk's upper bound, which
-    // is also what leaves the range's own lower bound, `after`, excluded.
-    const chunk = rule.between(lower, new Date(upper.getTime() + 1))
+    let step: ReturnType<typeof rule.between>
 
-    for (let index = chunk.length - 1; index >= 0 && occurrences.length < limit; index--) {
-      occurrences.push(toDate(chunk[index]!))
+    try {
+      // between() excludes both ends. The upper bound is nudged past so an occurrence on it is
+      // included, and the lower one stays excluded because it is the next step's upper bound, which
+      // is also what leaves the range's own lower bound, `after`, excluded.
+      step = rule.between(new Date(lower), new Date(upper + 1))
+    } catch (err) {
+      if (upper - lower <= floor) {
+        throw err
+      }
+
+      ceiling = Math.max(floor, Math.floor((upper - lower) / 2))
+      width = ceiling
+
+      continue
+    }
+
+    if (step.length > 0) {
+      return toDate(step[step.length - 1]!)
     }
 
     upper = lower
-    width *= CHUNK_GROWTH
+    width = Math.min(width * STEP_GROWTH, ceiling)
   }
 
-  return occurrences
+  return null
 }
 
 /**

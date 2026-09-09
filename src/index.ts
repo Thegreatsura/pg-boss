@@ -17,6 +17,7 @@ export { JOB_STATES as states } from './plans.ts'
 export { QUEUE_POLICIES as policies } from './plans.ts'
 export { SCHEDULE_KINDS as scheduleKinds } from './plans.ts'
 export { SCHEDULE_MISSED_POLICIES as scheduleMissedPolicies } from './plans.ts'
+export { PREVIEW_MAX_COUNT as previewScheduleMaxCount } from './timekeeper.ts'
 
 export const events: types.Events = Object.freeze({
   error: 'error',

@@ -84,21 +84,22 @@ export const SCHEDULE_KIND_CHECK = `kind IN ('${SCHEDULE_KINDS.cron}', '${SCHEDU
  *
  * A pass sends what the last minute holds, so nothing outside that window is sent at all: a
  * deployment that was down, or between deploys, for an hour never sends the occurrences that hour
- * held. `skip` is that behavior, and stays the default, since a queue drained by a backlog of
- * catch-up jobs on the first pass after a deploy is a surprise nobody asked for.
+ * held. `skip` is that behavior, and stays the default, since a job appearing on the first pass
+ * after a deploy for work whose moment has passed is a surprise nobody asked for.
  *
  * `once` sends a single job however many occurrences were missed, which is what a schedule whose
  * job reads the current state of the world wants: a nightly report that missed three nights is one
- * report, not three. `all` sends one job per missed occurrence, for a schedule whose job does a
- * piece of work per occurrence that still has to happen.
+ * report, not three. One job needs no occurrence identity to be worth running, which is what a
+ * policy sending a job per missed occurrence would need and has no way to carry: the forwarded job
+ * gets the schedule's `data` and nothing else, so a handler could not tell which hour of an outage
+ * each of twelve identical jobs was for.
  *
  * Part of the options blob rather than a column of its own: the pass reads every schedule row
  * anyway, and nothing queries the table by policy.
  */
 export const SCHEDULE_MISSED_POLICIES = Object.freeze({
   skip: 'skip',
-  once: 'once',
-  all: 'all'
+  once: 'once'
 } as const)
 
 const QUEUE_DEFAULTS = {
@@ -260,6 +261,10 @@ function createTableQueue (schema: string) {
 // `cron` holds the expression whatever its format, and `kind` says which format that is: the column
 // predates rules and renaming it would break every consumer reading the table, from the dashboard to
 // a hand-written query.
+//
+// `timezone` defaults to UTC rather than to null, so a row written straight into the table with SQL
+// gets the zone schedule() would have given it. Nullable still, because an instance on an older
+// release can write a null during a rolling upgrade, which is what the read-side COALESCE covers.
 function createTableSchedule (schema: string) {
   return `
     CREATE TABLE ${schema}.schedule (
@@ -267,7 +272,7 @@ function createTableSchedule (schema: string) {
       key text not null DEFAULT '',
       kind text not null DEFAULT '${SCHEDULE_KINDS.cron}' CHECK (${SCHEDULE_KIND_CHECK}),
       cron text not null,
-      timezone text,
+      timezone text DEFAULT 'UTC',
       data jsonb,
       options jsonb,
       created_on timestamp with time zone not null default now(),

@@ -166,7 +166,9 @@ const scheduleQuerySchema = z.object({
 //
 // The count ceiling mirrors the method's own, so a count past it is a 400 naming the parameter
 // rather than a 500 carrying the assertion text, and the generated OpenAPI parameter says what the
-// limit is instead of leaving a client to find it by being refused.
+// limit is instead of leaving a client to find it by being refused. Spelled out for the same reason
+// `missed` is in contracts.ts: the core exports it as previewScheduleMaxCount from 12.31.0, and the
+// literal moves to that export at the next dependency bump.
 const previewScheduleQuerySchema = z.object({
   cron: z.string().min(1),
   tz: z.string().optional(),

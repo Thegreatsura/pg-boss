@@ -5,7 +5,7 @@ import EventEmitter from 'node:events'
 import * as Attorney from './attorney.ts'
 import type Manager from './manager.ts'
 import * as plans from './plans.ts'
-import { isRrule, nextOccurrence, occurrencesBefore, occurrencesInWindow, assertRrule, assertRruleSends } from './rrule.ts'
+import { isRrule, latestOccurrenceBefore, nextOccurrence, occurrencesInWindow, assertRrule, assertRruleSends } from './rrule.ts'
 import { assertTimezone } from './timezone.ts'
 import { delay } from './tools.ts'
 import * as types from './types.ts'
@@ -29,15 +29,16 @@ const WARNINGS = {
 
 const WARNING_TYPES = {
   CLOCK_SKEW: 'clock_skew',
-  INVALID_SCHEDULE: 'invalid_schedule',
-  MISSED_OCCURRENCES_CAPPED: 'missed_occurrences_capped'
+  INVALID_SCHEDULE: 'invalid_schedule'
 } as const
 
 // previewSchedule() defaults and ceilings. The count ceiling is not a database limit, since the walk
 // is pure cron-parser arithmetic, but an unbounded count on a per-second expression is a foot-gun.
 // A caller that genuinely wants more can page by passing the last occurrence back as `from`.
 const PREVIEW_DEFAULT_COUNT = 5
-const PREVIEW_MAX_COUNT = 1000
+
+/** Exported so a caller building a form or an HTTP parameter around the ceiling reads it here. */
+export const PREVIEW_MAX_COUNT = 1000
 
 // Count is the wrong budget on its own, because occurrences are not equally priced: 1000 of a
 // per-second expression cost about 8ms, 1000 of '0 0 1 1 *' about 160ms, and 1000 of '0 0 29 2 *'
@@ -49,10 +50,10 @@ const PREVIEW_TIME_BUDGET_MS = 1000
 
 // What the cron pass puts on the send-it queue. `key` identifies the schedule row the occurrence
 // came from, so the handler can record the job it produced. `slot` is the throttle slot that
-// occurrence was filed in, which is how the handler tells the runs in a catch-up batch apart and
-// records the latest of them. Both are absent on rows written by an instance older than 12.31.0,
-// and `slot` is absent on a cron occurrence in the due window, which the insert files from its own
-// clock, so the handler treats them as optional rather than required.
+// occurrence was filed in, which is how the handler tells a catch-up run from the due one it can
+// arrive beside and records the later of the two. Both are absent on rows written by an instance
+// older than 12.31.0, and `slot` is absent on a cron occurrence in the due window, which the insert
+// files from its own clock, so the handler treats them as optional rather than required.
 type ScheduledRequest = types.Request & { key?: string, slot?: string }
 
 // One schedule occurrence that produced a job, as handed to plans.setScheduleLastJobIds. camelCase
@@ -65,22 +66,6 @@ type FiredSchedule = { name: string, key: string, jobId: string }
 // same occurrence and send it twice, and a slot wider than the window collapses two occurrences a
 // window apart into one job.
 const OCCURRENCE_WINDOW_SECONDS = 60
-
-// The most occurrences one schedule catches up on in a single pass under `missed: 'all'`.
-//
-// A gap has no natural size: a database resumed after a month owes a per-minute schedule some forty
-// thousand jobs, and creating them is the least of it, since every one of them is then a job a
-// worker has to run. Once created they reach their queue at the rate the send-it worker forwards
-// them, 50 a poll on cronWorkerIntervalSeconds, so a capped backlog takes something like twenty
-// seconds at the default of a second to turn into real jobs.
-//
-// The cap is also what bounds the read, which is synchronous like the rest of the pass, though not
-// by much: 1000 occurrences measured 1 to 4ms as a rule and 5 to 16ms as a cron expression, and a
-// gap ten times wider costs the same, since both formats are read backwards from the window.
-//
-// The newest are the ones kept. A schedule catching up on a month has a month of work behind it
-// either way, and the recent end of that is the part still worth doing.
-const MAX_MISSED_OCCURRENCES = 1000
 
 /** The policy names, for the check schedule() performs and the one the pass performs. */
 const MISSED_POLICIES = Object.values(plans.SCHEDULE_MISSED_POLICIES)
@@ -440,17 +425,19 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
         continue
       }
 
-      let missed: Date[] = []
+      let missed: Date | null = null
 
       try {
-        missed = await this.missedOccurrences(schedule, due.kind, lastPass, windowStart)
+        missed = this.missedOccurrence(schedule, due.kind, lastPass, windowStart)
       } catch (err) {
         // Its own try, so a catch-up that cannot be read does not cost the occurrence that is due
-        // now. It is the same expression, but over a range as wide as the outage rather than a
-        // minute, and the width is what can fail on its own: cron-parser gives up walking a sparse
-        // expression far enough back. The gap closes on the next pass whatever happens here, since
-        // the claim has already moved, so the backlog is gone rather than deferred, which is why
-        // this warns rather than passing over it.
+        // now. The two reads are hard to make diverge: the backwards one narrows its steps until
+        // they are no wider than an hour, and an expression rrule-temporal refuses at an hour it
+        // refuses over a minute too, which the read above catches and skips the whole row for. They
+        // stay split anyway, because sharing the try was a real defect once and nothing about two
+        // separate calls over different ranges makes it safe to couple them again. If a catch-up
+        // does fail on its own the gap still closes, since the claim has already moved, so the
+        // occurrence is gone rather than deferred and the operator is told.
         await warn(`Warning: schedule for queue "${name}" (key "${key}") could not be caught up on the gap since the last cron pass: ${(err as Error).message}`)
       }
 
@@ -471,14 +458,18 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
       // boundary crossing.
       //
       // A missed occurrence names its slot for that reason and one more: it is older than the
-      // window, so a slot off insert time would file the whole backlog in the slot the pass runs in
-      // and collapse it into a single job. Every slot a missed occurrence names is older than the
-      // slot insert time computes, so none of them can collide with the cron job filed below.
+      // window, so a slot off insert time would file it in the slot the pass runs in, where it
+      // would collide with the cron job filed below and be dropped. The slot it names is older
+      // than the one insert time computes, so it cannot.
       //
       // One job per slot rather than one per occurrence, which is the resolution the docs promise:
       // a rule finer than a slot sends a job a slot, and two occurrences inside one window that
       // fall in slots of their own each send.
-      const slots = new Set(missed.map(throttleSlot))
+      const slots = new Set<string>()
+
+      if (missed !== null) {
+        slots.add(throttleSlot(missed))
+      }
 
       if (due.kind === plans.SCHEDULE_KINDS.rrule) {
         // Through the set the missed occurrences went through, since the window's lower bound falls
@@ -554,8 +545,8 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
   }
 
   /**
-   * What a schedule owes for the gap since the last pass, oldest first, as its `missed` policy asks
-   * for it. Empty for every schedule under the default policy, and for every schedule at all in a
+   * The occurrence a schedule owes a job for from the gap since the last pass, or null when it owes
+   * none. Null for every schedule under the default policy, and for every schedule at all in a
    * deployment whose passes keep running.
    *
    * The gap is (lastPass, windowStart]: older than the due window, so no pass has sent it, and
@@ -565,66 +556,43 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
    * running and fills up when they stop: a deployment that is down, between deploys, or running
    * with scheduling switched off.
    *
+   * The most recent occurrence rather than all of them, which is the whole of what `once` promises:
+   * a job carries the schedule's `data` and nothing else, so a job per missed occurrence would be
+   * twelve identical jobs after a twelve-hour outage with no way for a handler to tell which hour
+   * each was for. One job whose meaning is "catch up to now" needs no such identity.
+   *
    * Bounded below by the row's own `created_on` as well, so a schedule written during the gap does
-   * not start life owing the occurrences of an expression that was not in the table yet. Not by
+   * not start life owing an occurrence of an expression that was not in the table yet. Not by
    * `updated_on`, which a deployment calling schedule() on every boot rewrites on the way up: that
    * would leave the policy with nothing to catch up on in precisely the case it exists for.
    */
-  private async missedOccurrences (schedule: types.Schedule, kind: types.ScheduleKind, lastPass: number | null, windowStart: number): Promise<Date[]> {
-    const { name, key, cron, timezone, options, createdOn } = schedule
+  private missedOccurrence (schedule: types.Schedule, kind: types.ScheduleKind, lastPass: number | null, windowStart: number): Date | null {
+    const { cron, timezone, options, createdOn } = schedule
 
-    const policy = missedPolicy(options)
-
-    if (policy === plans.SCHEDULE_MISSED_POLICIES.skip || lastPass === null) {
-      return []
+    if (missedPolicy(options) === plans.SCHEDULE_MISSED_POLICIES.skip || lastPass === null) {
+      return null
     }
 
     const from = Math.max(lastPass, toTime(createdOn) ?? lastPass)
 
     if (from >= windowStart) {
-      return []
+      return null
     }
 
-    // `once` is one job however deep the backlog, which is what a schedule whose job reads the
-    // current state of the world wants: a report that missed three nights is one report.
-    const limit = policy === plans.SCHEDULE_MISSED_POLICIES.once ? 1 : MAX_MISSED_OCCURRENCES
-
-    // One past the limit, so hitting it is told apart from landing on it exactly, and the walk pays
-    // for a single extra occurrence to know which it was.
-    const occurrences = this.readOccurrencesBefore(cron, kind, timezone, new Date(from), new Date(windowStart), limit + 1)
-
-    if (occurrences.length > limit) {
-      occurrences.length = limit
-
-      // Only under `all`, which is the policy that asked for every occurrence and is not getting
-      // them. A deeper backlog under `once` is the policy working as documented.
-      if (policy === plans.SCHEDULE_MISSED_POLICIES.all) {
-        await emitAndPersistWarning(
-          this.warningContext,
-          WARNING_TYPES.MISSED_OCCURRENCES_CAPPED,
-          `Warning: schedule for queue "${name}" (key "${key}") came due more than ${limit} times while no cron pass ran; the ${limit} most recent were sent and the rest dropped.`,
-          { queue: name, key, cron, timezone, limit, since: new Date(from).toISOString() }
-        )
-      }
-    }
-
-    // Chronological, so a backlog reaches the send-it queue in the order it came due. Nothing
-    // downstream promises to run it in that order: the jobs are created by one insert and share a
-    // created_on, so a worker picking two of them up orders them however the fetch does.
-    return occurrences.reverse()
+    return this.latestOccurrenceBefore(cron, kind, timezone, new Date(from), new Date(windowStart))
   }
 
   /**
-   * The occurrences an expression produces in (after, until], newest first, at most `limit` of
-   * them, read as `kind` says to read it.
+   * The most recent occurrence an expression produces in (after, until], read as `kind` says to
+   * read it, or null when the range holds none.
    *
-   * Backwards and bounded rather than a walk forwards over the range: the range is as wide as the
-   * gap it covers, the walk is synchronous like the rest of the pass, and what it costs has to
-   * follow the number of jobs it will send rather than the length of an outage.
+   * Backwards from the window rather than forwards from the gap's start: the range is as wide as
+   * the outage it covers, the read is synchronous like the rest of the pass, and what it costs has
+   * to follow the one job it will send rather than the length of the outage.
    */
-  private readOccurrencesBefore (expression: string, kind: types.ScheduleKind, tz: string, after: Date, until: Date, limit: number): Date[] {
+  private latestOccurrenceBefore (expression: string, kind: types.ScheduleKind, tz: string, after: Date, until: Date): Date | null {
     if (kind === plans.SCHEDULE_KINDS.rrule) {
-      return occurrencesBefore(expression, after, until, tz, limit)
+      return latestOccurrenceBefore(expression, after, until, tz)
     }
 
     // cron-parser's prev() answers strictly before its reference date, so the reference is a
@@ -633,19 +601,9 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     // other, never both.
     const interval = CronExpressionParser.parse(expression, { tz, strict: false, currentDate: new Date(until.getTime() + 1) })
 
-    const occurrences: Date[] = []
+    const occurrence = interval.prev().toDate()
 
-    while (occurrences.length < limit) {
-      const occurrence = interval.prev().toDate()
-
-      if (occurrence.getTime() <= after.getTime()) {
-        break
-      }
-
-      occurrences.push(occurrence)
-    }
-
-    return occurrences
+    return occurrence.getTime() > after.getTime() ? occurrence : null
   }
 
   /**

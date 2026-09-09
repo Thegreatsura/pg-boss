@@ -91,7 +91,7 @@ export const updateOptionsSchema = z.object({
 export const scheduleOptionsSchema = sendOptionsSchemaBase.extend({
   tz: z.string().optional(),
   key: z.string().optional(),
-  missed: z.enum(['skip', 'once', 'all']).optional(),
+  missed: z.enum(['skip', 'once']).optional(),
 }) satisfies z.ZodType<types.HttpScheduleOptions>
 
 export const fetchOptionsSchema = z.object({

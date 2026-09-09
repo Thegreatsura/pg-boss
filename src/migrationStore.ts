@@ -1619,16 +1619,20 @@ function getAll (schema: string, noPartitioning = false, noCovering = false): ty
       // only covered `undefined`, and how a row written with SQL leaves it out. Nothing ever chose
       // it: schedule()'s default is UTC and the docs say UTC, but cron-parser reads a non-string
       // zone as unset, so those rows have been firing in the local zone of whichever instance took
-      // the pass. UTC is what their authors asked for.
+      // the pass. UTC is what their authors asked for. The default on the column keeps the next
+      // hand-written insert from making another one, and matches what a fresh install now builds.
       install: [
         `ALTER TABLE ${schema}.schedule ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT '${plans.SCHEDULE_KINDS.cron}' CHECK (${plans.SCHEDULE_KIND_CHECK})`,
         `UPDATE ${schema}.schedule SET kind = '${plans.SCHEDULE_KINDS.rrule}'
           WHERE kind = '${plans.SCHEDULE_KINDS.cron}'
             AND (cron ~* '(^|[[:space:]]|;)FREQ=' OR cron ~* '(^|[[:space:]])(DTSTART|RRULE|RDATE|EXDATE)[;:]')`,
         `UPDATE ${schema}.schedule SET timezone = 'UTC' WHERE timezone IS NULL`,
+        `ALTER TABLE ${schema}.schedule ALTER COLUMN timezone SET DEFAULT 'UTC'`,
         `ALTER TABLE ${schema}.schedule ADD COLUMN IF NOT EXISTS last_job_id uuid`
       ],
-      // Dropping `kind` drops its CHECK with it, since the constraint belongs to the column.
+      // Dropping `kind` drops its CHECK with it, since the constraint belongs to the column. The
+      // zone default is left in place: a v40 instance names the column on every write, so the
+      // default it would fall back on never applies, and keeping it costs a rollback nothing.
       uninstall: [
         `ALTER TABLE ${schema}.schedule DROP COLUMN kind`,
         `ALTER TABLE ${schema}.schedule DROP COLUMN last_job_id`

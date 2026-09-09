@@ -903,7 +903,7 @@
         "column": "timezone",
         "type": "text",
         "notNull": false,
-        "default": null
+        "default": "'UTC'::text"
       },
       {
         "table": "schedule",
@@ -1872,7 +1872,7 @@
         "column": "timezone",
         "type": "text",
         "notNull": false,
-        "default": null
+        "default": "'UTC'::text"
       },
       {
         "table": "schedule",

@@ -193,8 +193,7 @@ describe('utils', () => {
 
   describe('WARNING_TYPES constant', () => {
     // Mirrors WarningType in the pg-boss core; index_bloat arrived with reindex maintenance in
-    // 12.29.0, xmin_horizon/autovacuum_disabled/monitor_backoff with vacuum monitoring in 12.30.0,
-    // and missed_occurrences_capped with schedule catch-up in 12.31.0
+    // 12.29.0 and xmin_horizon/autovacuum_disabled/monitor_backoff with vacuum monitoring in 12.30.0
     it('covers every warning type the core writes', () => {
       expect([...WARNING_TYPES]).toEqual([
         'slow_query',
@@ -202,7 +201,6 @@ describe('utils', () => {
         'clock_skew',
         'listen_notify_unavailable',
         'invalid_schedule',
-        'missed_occurrences_capped',
         'index_bloat',
         'xmin_horizon',
         'autovacuum_disabled',

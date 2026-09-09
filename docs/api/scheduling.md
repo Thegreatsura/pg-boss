@@ -94,14 +94,10 @@ A pass sends the occurrences of the preceding 60 seconds, so an occurrence that 
 | --- | --- |
 | `skip` | Nothing. The default, and what every earlier release did |
 | `once` | One job, for the most recent missed occurrence, however many were missed |
-| `all` | One job per missed occurrence, oldest first |
 
 ```js
 // a nightly report reads the current state of the world, so three missed nights are one report
 await boss.schedule('report', '0 3 * * *', null, { missed: 'once' })
-
-// an hourly export has a file to write per hour, so every hour that was missed still has to run
-await boss.schedule('export', '0 * * * *', null, { missed: 'all' })
 ```
 
 The gap runs from the last time any instance ran a cron pass, which pg-boss records on its version row, to the moment the due window opens. Passes claim every `cronMonitorIntervalSeconds` (30 by default, 45 at the ceiling) against a 60-second window, so a deployment whose passes keep running has no gap and the option costs it nothing. A gap opens when the passes stop: the deployment is down, in the middle of a deploy, or running with `schedule: false`.
@@ -110,17 +106,15 @@ A schedule never reaches back past its own row. `created_on` bounds the range, s
 
 The option applies to both formats, and a rule is read backwards over the gap the same way a cron expression is.
 
-Worth knowing before choosing `all`:
+Worth knowing before choosing `once`:
 
-* **One pass sends at most 1000 occurrences per schedule**, keeping the most recent, since a per-minute schedule owes some forty thousand jobs after a month down. When the cap truncates a backlog, the pass emits a [`missed_occurrences_capped`](./events.md#warning) warning naming the schedule.
+* **A caught-up job is indistinguishable from an on-time one.** It carries the schedule's `data` unchanged and is created when the pass catches up, so a handler cannot tell it is late or which occurrence it stands for. That is what makes `once` the whole of the option: a job whose meaning is "catch up to now" needs no occurrence identity, and a policy sending a job per missed occurrence would need one the payload has no way to carry.
 
-* **A backlog takes time to become jobs.** The pass creates one internal job per missed occurrence and the worker behind it forwards 50 a poll, so a capped catch-up reaches its queue over something like twenty seconds at the default `cronWorkerIntervalSeconds` of 1. Reading the occurrences costs a few milliseconds, whatever the length of the outage: both formats are read backwards from the due window and stop at the cap.
+* **The occurrence it names is the most recent one in the gap.** Three days down sends one job for last night's occurrence, and the two nights before it are not sent at all.
 
-* **A caught-up job is indistinguishable from an on-time one.** It carries the schedule's `data` unchanged and is created when the pass catches up, so a handler cannot tell it is late, or which occurrence it is running for.
+* **It can arrive beside the occurrence that is due now.** Those are two jobs: the catch-up job is filed under the minute its occurrence fell in and the due one under the minute the pass is running in, so the two do not collapse into one. A schedule whose most recent missed occurrence shares a minute with a due one sends a single job, since they share that slot.
 
-* **The backlog is not ordered.** It reaches the queue oldest first, in one insert, but every job in it is immediately runnable and workers fetch them in no particular order.
-
-* **Queue policy and send options apply to every job in it.** A `singletonKey` in the schedule's options, or a queue whose policy allows one queued job (`short`, `stately`, `exclusive`), collapses a backlog into the single job that policy allows. A `singleton` queue, which allows one active job and unlimited queued, runs one through at a time.
+* **Queue policy and send options apply to it like any other job.** A `singletonKey` in the schedule's options, or a queue whose policy allows one queued job (`short`, `stately`, `exclusive`), can collapse the catch-up job and the due one into whichever the policy allows.
 
 The pass that reads a gap is also the one that closes it, so an occurrence lost to a pass that claimed and then failed is not caught up by the next one. During a rolling upgrade, an instance on a release without catch-up runs passes that close a gap without catching up on it.
 
@@ -153,8 +147,8 @@ Schedules a job to be sent to the specified queue based on a cron expression or 
 * **missed**
 
   What the schedule sends for occurrences that came due while no cron pass ran: `skip` (the
-  default), `once` or `all`. See [Catch-up after an outage](#catch-up-after-an-outage). A `null`
-  policy reads as none given, like a `null` zone; any other value is rejected.
+  default) or `once`. See [Catch-up after an outage](#catch-up-after-an-outage). A `null` policy
+  reads as none given, like a `null` zone; any other value is rejected.
 
 
 For example, the following code will send a job at 3:00am in the US central time zone into the queue `notification-abc`.

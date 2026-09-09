@@ -2,7 +2,7 @@ import { expect } from 'vitest'
 import { delay } from '../src/tools.ts'
 import * as helper from './testHelper.ts'
 import Timekeeper from '../src/timekeeper.ts'
-import { isRrule, nextOccurrence, occurrencesBefore, occurrencesInWindow, assertRrule, assertRruleSends } from '../src/rrule.ts'
+import { isRrule, latestOccurrenceBefore, nextOccurrence, occurrencesInWindow, assertRrule, assertRruleSends } from '../src/rrule.ts'
 import { ctx } from './hooks.ts'
 
 // Most of this needs no database: an expression is read by a pure function of (expression, after,
@@ -350,8 +350,9 @@ describe('rrule', function () {
     // An RDATE is an absolute instant rather than a phase of the rule, and rrule-temporal's
     // previous() walks backwards from a phase-aligned DTSTART: handed a rule carrying one it
     // answers with the RDATE in place of the occurrence that follows it and loses everything in
-    // between, so a catch-up read built on it dropped jobs for every calendar entry with an RDATE
-    // on it. Both directions read through between() now, so the two agree on every shape.
+    // between, so a catch-up read built on it named the wrong occurrence for every calendar entry
+    // with an RDATE on it. Both directions read through between() now, so the two agree on every
+    // shape.
     const shapes: Array<[string, string[]]> = [
       ['no RDATE', []],
       ['an RDATE between two occurrences', [`RDATE:${ical(Date.UTC(2026, 8, 9, 10, 30, 12))}`]],
@@ -359,7 +360,9 @@ describe('rrule', function () {
       ['two RDATEs', [`RDATE:${ical(Date.UTC(2026, 8, 9, 10, 30, 12))}`, `RDATE:${ical(Date.UTC(2026, 8, 9, 11, 30, 12))}`]],
       ['an RDATE before the range', [`RDATE:${ical(Date.UTC(2026, 8, 9, 3, 30, 12))}`]],
       ['an RDATE after the range', [`RDATE:${ical(Date.UTC(2026, 8, 9, 20, 30, 12))}`]],
+      ['an RDATE past the upper bound', [`RDATE:${ical(Date.UTC(2026, 8, 9, 11, 59, 59))}`]],
       ['an EXDATE', [`EXDATE:${ical(Date.UTC(2026, 8, 9, 10, 0, 0))}`]],
+      ['an EXDATE on the upper bound', [`EXDATE:${ical(Date.UTC(2026, 8, 9, 12, 0, 0))}`]],
       ['an RDATE and an EXDATE', [`RDATE:${ical(Date.UTC(2026, 8, 9, 10, 30, 12))}`, `EXDATE:${ical(Date.UTC(2026, 8, 9, 11, 0, 0))}`]]
     ]
 
@@ -367,9 +370,9 @@ describe('rrule', function () {
       const expression = [`DTSTART:${ical(hour)}`, 'RRULE:FREQ=HOURLY', ...extra].join('\n')
 
       const forwards = occurrencesInWindow(expression, after, until, 'UTC').map(date => date.toISOString())
-      const backwards = occurrencesBefore(expression, after, until, 'UTC', 100).map(date => date.toISOString()).reverse()
+      const backwards = latestOccurrenceBefore(expression, after, until, 'UTC')?.toISOString() ?? null
 
-      expect(backwards, shape).toEqual(forwards)
+      expect(backwards, shape).toEqual(forwards[forwards.length - 1] ?? null)
     }
   })
 
@@ -377,25 +380,67 @@ describe('rrule', function () {
     const noon = Date.UTC(2026, 8, 9, 12, 0, 0)
     const expression = `DTSTART:${ical(Date.UTC(2026, 8, 9, 0, 0, 0))}\nRRULE:FREQ=HOURLY`
 
-    const read = (after: number, until: number, limit = 100) =>
-      occurrencesBefore(expression, new Date(after), new Date(until), 'UTC', limit).map(date => date.toISOString())
+    const read = (after: number, until: number) =>
+      latestOccurrenceBefore(expression, new Date(after), new Date(until), 'UTC')?.toISOString() ?? null
 
-    // Newest first, the upper bound included and the lower excluded, which is where the due window
-    // starts: an occurrence on the bound belongs to one range or the other, never both.
-    expect(read(noon - 2 * 3_600_000, noon)).toEqual([
-      new Date(noon).toISOString(),
-      new Date(noon - 3_600_000).toISOString()
-    ])
+    // The upper bound included and the lower excluded, which is where the due window starts: an
+    // occurrence on the bound belongs to one range or the other, never both.
+    expect(read(noon - 2 * 3_600_000, noon)).toBe(new Date(noon).toISOString())
+    expect(read(noon - 2 * 3_600_000, noon - 1)).toBe(new Date(noon - 3_600_000).toISOString())
+    expect(read(noon - 3_600_000, noon - 1)).toBeNull()
 
-    // The cap keeps the recent end, and reading a range with nothing in it is not an error
-    expect(read(noon - 90 * 24 * 3_600_000, noon, 3)).toEqual([
-      new Date(noon).toISOString(),
-      new Date(noon - 3_600_000).toISOString(),
-      new Date(noon - 2 * 3_600_000).toISOString()
-    ])
+    // A range reaching back past the rule's own start, and one holding nothing at all, are both
+    // answers rather than errors
+    expect(read(noon - 90 * 24 * 3_600_000, noon)).toBe(new Date(noon).toISOString())
+    expect(read(noon - 60_000, noon - 30_000)).toBeNull()
+    expect(read(noon, noon)).toBeNull()
+  })
 
-    expect(read(noon - 60_000, noon - 30_000)).toEqual([])
-    expect(read(noon, noon)).toEqual([])
+  it('reads backwards past a stretch the rule is empty over', function () {
+    const noon = Date.UTC(2026, 8, 9, 12, 0, 0)
+    const day = 24 * 3_600_000
+
+    // The read widens its steps backwards to reach a sparse expression over a long gap, which is a
+    // guess about density that a rule empty near the window and dense behind it defeats: a step
+    // grows until it spans more occurrences than rrule-temporal generates in one call, and it
+    // throws rather than truncating. Narrowing on the overrun is what keeps each of these an
+    // answer, and the widening is what keeps the sparse ones cheap.
+    const shapes: Array<[string, string, number]> = [
+      ['minutely, still recurring', 'FREQ=MINUTELY', noon],
+      ['minutely, spent an hour back', `FREQ=MINUTELY;UNTIL=${ical(noon - 3_600_000)}`, noon - 3_600_000],
+      ['minutely, spent a day back', `FREQ=MINUTELY;UNTIL=${ical(noon - day)}`, noon - day],
+      ['minutely, spent three days back', `FREQ=MINUTELY;UNTIL=${ical(noon - 3 * day)}`, noon - 3 * day],
+      ['secondly, spent a day back', `FREQ=SECONDLY;UNTIL=${ical(noon - day)}`, noon - day],
+      ['secondly, spent twenty days back', `FREQ=SECONDLY;UNTIL=${ical(noon - 20 * day)}`, noon - 20 * day],
+      ['daily at nine', 'FREQ=DAILY;BYHOUR=9', Date.UTC(2026, 8, 9, 9, 0, 0)],
+      ['monthly on the last friday', 'FREQ=MONTHLY;BYDAY=-1FR;BYHOUR=17', Date.UTC(2026, 7, 28, 17, 0, 0)]
+    ]
+
+    for (const [shape, rule, expected] of shapes) {
+      const expression = `DTSTART:${ical(Date.UTC(2025, 0, 1, 0, 0, 0))}\nRRULE:${rule}`
+
+      const occurrence = latestOccurrenceBefore(expression, new Date(noon - 30 * day), new Date(noon), 'UTC')
+
+      expect(occurrence?.toISOString(), shape).toBe(new Date(expected).toISOString())
+    }
+  })
+
+  it('reports a rule it cannot read at its narrowest step rather than looping on it', function () {
+    const noon = Date.UTC(2026, 8, 9, 12, 0, 0)
+
+    // A COUNT rule is the one shape rrule-temporal cannot start near the window for, since the
+    // occurrence set depends on the index from the true DTSTART, so it walks from there and gives
+    // up at its iteration ceiling. Narrowing the step cannot help with that, and pretending the
+    // range is empty would send nothing and say nothing, so the read says what happened. The due
+    // window read refuses the same expression, which is what the pass reports first.
+    const expression = `DTSTART:${ical(Date.UTC(2020, 0, 1, 0, 0, 0))}
+RRULE:FREQ=SECONDLY;COUNT=500000`
+
+    expect(() => latestOccurrenceBefore(expression, new Date(noon - 30 * 24 * 3_600_000), new Date(noon), 'UTC'))
+      .toThrow(/Maximum iterations/)
+
+    expect(() => occurrencesInWindow(expression, new Date(noon - 60_000), new Date(noon), 'UTC'))
+      .toThrow(/Maximum iterations/)
   })
 
   it('fires a rule whose occurrence falls inside the window, measured on the database clock', function () {

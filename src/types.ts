@@ -737,8 +737,8 @@ export type ScheduleOptions = SendOptions & {
    * What to do about occurrences that came due while no cron pass ran, which is what a deployment
    * being down, or between deploys, leaves behind.
    *
-   * `skip` sends nothing for them. `once` sends a single job however many were missed. `all` sends
-   * one job per missed occurrence, up to 1000 per schedule per pass, newest first.
+   * `skip` sends nothing for them. `once` sends a single job for the most recent one, however many
+   * were missed.
    * @default 'skip'
    */
   missed?: ScheduleMissedPolicy
@@ -972,7 +972,7 @@ export interface Request {
 export type ScheduleKind = 'cron' | 'rrule'
 
 /** What a schedule does about occurrences that came due while no cron pass ran. */
-export type ScheduleMissedPolicy = 'skip' | 'once' | 'all'
+export type ScheduleMissedPolicy = 'skip' | 'once'
 
 export interface Schedule {
   name: string;
@@ -1135,7 +1135,7 @@ export type UpdateQueueOptions = Omit<Queue, 'name' | 'partition' | 'policy' | '
 
 export interface Warning { message: string, data: object }
 
-export type WarningType = 'slow_query' | 'queue_backlog' | 'clock_skew' | 'listen_notify_unavailable' | 'invalid_schedule' | 'missed_occurrences_capped' | 'index_bloat' | 'xmin_horizon' | 'autovacuum_disabled' | 'monitor_backoff'
+export type WarningType = 'slow_query' | 'queue_backlog' | 'clock_skew' | 'listen_notify_unavailable' | 'invalid_schedule' | 'index_bloat' | 'xmin_horizon' | 'autovacuum_disabled' | 'monitor_backoff'
 
 export interface PersistedWarning {
   id: number;
