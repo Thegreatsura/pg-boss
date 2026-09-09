@@ -730,7 +730,19 @@ export interface QueueResult extends Queue {
   singletonsActive: string[] | null;
 }
 
-export type ScheduleOptions = SendOptions & { tz?: string, key?: string }
+export type ScheduleOptions = SendOptions & {
+  tz?: string,
+  key?: string,
+  /**
+   * What to do about occurrences that came due while no cron pass ran, which is what a deployment
+   * being down, or between deploys, leaves behind.
+   *
+   * `skip` sends nothing for them. `once` sends a single job however many were missed. `all` sends
+   * one job per missed occurrence, up to 1000 per schedule per pass, newest first.
+   * @default 'skip'
+   */
+  missed?: ScheduleMissedPolicy
+}
 
 export interface PreviewScheduleOptions {
   /**
@@ -959,6 +971,9 @@ export interface Request {
 /** Which format a schedule's expression is in. */
 export type ScheduleKind = 'cron' | 'rrule'
 
+/** What a schedule does about occurrences that came due while no cron pass ran. */
+export type ScheduleMissedPolicy = 'skip' | 'once' | 'all'
+
 export interface Schedule {
   name: string;
   key: string;
@@ -968,7 +983,11 @@ export interface Schedule {
   cron: string;
   timezone: string;
   data?: object;
-  options?: SendOptions;
+  /**
+   * The options blob `schedule()` stored, which is every option it was given: the `send()` options
+   * each job is created with, and `tz`, `key` and `missed` beside them.
+   */
+  options?: ScheduleOptions;
   createdOn: Date;
   updatedOn: Date;
   /**
@@ -1116,7 +1135,7 @@ export type UpdateQueueOptions = Omit<Queue, 'name' | 'partition' | 'policy' | '
 
 export interface Warning { message: string, data: object }
 
-export type WarningType = 'slow_query' | 'queue_backlog' | 'clock_skew' | 'listen_notify_unavailable' | 'invalid_schedule' | 'index_bloat' | 'xmin_horizon' | 'autovacuum_disabled' | 'monitor_backoff'
+export type WarningType = 'slow_query' | 'queue_backlog' | 'clock_skew' | 'listen_notify_unavailable' | 'invalid_schedule' | 'missed_occurrences_capped' | 'index_bloat' | 'xmin_horizon' | 'autovacuum_disabled' | 'monitor_backoff'
 
 export interface PersistedWarning {
   id: number;

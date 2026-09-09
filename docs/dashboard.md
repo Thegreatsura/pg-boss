@@ -36,7 +36,7 @@ Every queue in the schema with its policy and cached counts (queued, deferred, r
 
 ### Schedules
 
-Cron-based schedules registered with `boss.schedule()`, showing the target queue, optional key, cron expression, a human-readable frequency, the next occurrence and timezone. **Schedule Job** creates a new schedule, and each schedule's detail page shows its data and options and lets you unschedule it.
+Schedules registered with `boss.schedule()`, showing the target queue, optional key, expression, a human-readable frequency, the next occurrence and timezone. The frequency and next occurrence are read from the expression as cron, so a schedule stored as an [RRULE](./api/scheduling.md#rrule-expressions) is listed with neither. **Schedule Job** creates a new schedule, and each schedule's detail page shows its data and options and lets you unschedule it.
 
 ![Schedules page](./images/dashboard-schedules.png)
 
@@ -256,6 +256,7 @@ Warnings correlate to [`warning`](./api/events.md#warning) events already emitte
 - `clock_skew`: Database clock drift detection
 - `listen_notify_unavailable`: `useListenNotify` is on but no listener could be established
 - `invalid_schedule`: A stored schedule could not be evaluated and was skipped
+- `missed_occurrences_capped`: A schedule catching up on an outage came due more times than one cron pass sends for it
 - `index_bloat`: A job index holds far more pages than its live entries need and was not rebuilt
 - `xmin_horizon`: Something is pinning the MVCC horizon, so vacuum reclaims nothing
 - `autovacuum_disabled`: Nothing is vacuuming a job table at all

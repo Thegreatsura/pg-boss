@@ -86,6 +86,42 @@ A rule is understood by any instance running a release that supports one. During
 * the combinations RFC 5545 forbids outright, such as `BYMONTHDAY` with a weekly frequency
 * a time zone no evaluation can use, reported in the same words a cron schedule reports it in
 
+## Catch-up after an outage
+
+A pass sends the occurrences of the preceding 60 seconds, so an occurrence that came due while no instance was running a pass is not sent at all: a deployment that was down, or between deploys, for an hour never sends what that hour held. The `missed` option decides what a schedule does about that.
+
+| `missed` | What a schedule sends for a gap |
+| --- | --- |
+| `skip` | Nothing. The default, and what every earlier release did |
+| `once` | One job, for the most recent missed occurrence, however many were missed |
+| `all` | One job per missed occurrence, oldest first |
+
+```js
+// a nightly report reads the current state of the world, so three missed nights are one report
+await boss.schedule('report', '0 3 * * *', null, { missed: 'once' })
+
+// an hourly export has a file to write per hour, so every hour that was missed still has to run
+await boss.schedule('export', '0 * * * *', null, { missed: 'all' })
+```
+
+The gap runs from the last time any instance ran a cron pass, which pg-boss records on its version row, to the moment the due window opens. Passes claim every `cronMonitorIntervalSeconds` (30 by default, 45 at the ceiling) against a 60-second window, so a deployment whose passes keep running has no gap and the option costs it nothing. A gap opens when the passes stop: the deployment is down, in the middle of a deploy, or running with `schedule: false`.
+
+A schedule never reaches back past its own row. `created_on` bounds the range, so a schedule written while nothing was running starts from when it was written rather than from the start of the outage. Re-running `schedule()` for an existing `(name, key)` leaves that bound where it is, which is what lets a deployment that registers its schedules on every boot still catch up on the outage it just ended.
+
+The option applies to both formats, and a rule is read backwards over the gap the same way a cron expression is.
+
+Worth knowing before choosing `all`:
+
+* **One pass sends at most 1000 occurrences per schedule**, keeping the most recent, since a per-minute schedule owes some forty thousand jobs after a month down. When the cap truncates a backlog, the pass emits a [`missed_occurrences_capped`](./events.md#warning) warning naming the schedule.
+
+* **A caught-up job is indistinguishable from an on-time one.** It carries the schedule's `data` unchanged and is created when the pass catches up, so a handler cannot tell it is late, or which occurrence it is running for.
+
+* **The backlog is not ordered.** It reaches the queue oldest first, in one insert, but every job in it is immediately runnable and workers fetch them in no particular order.
+
+* **Queue policy and send options apply to every job in it.** A `singletonKey` in the schedule's options, or a queue whose policy allows one queued job (`short`, `stately`, `exclusive`), collapses a backlog into the single job that policy allows. A `singleton` queue, which allows one active job and unlimited queued, runs one through at a time.
+
+The pass that reads a gap is also the one that closes it, so an occurrence lost to a pass that claimed and then failed is not caught up by the next one. During a rolling upgrade, an instance on a release without catch-up runs passes that close a gap without catching up on it.
+
 ## Managing schedules
 
 ### `schedule(name, cron, data, options)`
@@ -109,6 +145,12 @@ Schedules a job to be sent to the specified queue based on a cron expression or 
 * **key**
   
   An optional unique key if more than schedule is needed for this queue.
+
+* **missed**
+
+  What the schedule sends for occurrences that came due while no cron pass ran: `skip` (the
+  default), `once` or `all`. See [Catch-up after an outage](#catch-up-after-an-outage). Any other
+  value is rejected.
 
 
 For example, the following code will send a job at 3:00am in the US central time zone into the queue `notification-abc`.
@@ -161,7 +203,7 @@ Each schedule carries the following properties.
 | `cron` | Cron expression or recurrence rule |
 | `timezone` | Time zone the expression is evaluated in |
 | `data` | Payload sent with each job |
-| `options` | `send()` options applied to each job |
+| `options` | The options `schedule()` was given: the `send()` options each job is created with, and `tz`, `key` and `missed` beside them |
 | `createdOn` | When the schedule was first stored |
 | `updatedOn` | When the definition was last changed |
 | `lastJobId` | Id of the job the schedule most recently created |

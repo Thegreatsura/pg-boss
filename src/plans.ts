@@ -79,6 +79,28 @@ export const SCHEDULE_KINDS = Object.freeze({
 /** The kind column's domain, for the CHECK on the table and the migration that adds it. */
 export const SCHEDULE_KIND_CHECK = `kind IN ('${SCHEDULE_KINDS.cron}', '${SCHEDULE_KINDS.rrule}')`
 
+/**
+ * What a schedule does about occurrences that came due while no cron pass ran.
+ *
+ * A pass sends what the last minute holds, so nothing outside that window is sent at all: a
+ * deployment that was down, or between deploys, for an hour never sends the occurrences that hour
+ * held. `skip` is that behavior, and stays the default, since a queue drained by a backlog of
+ * catch-up jobs on the first pass after a deploy is a surprise nobody asked for.
+ *
+ * `once` sends a single job however many occurrences were missed, which is what a schedule whose
+ * job reads the current state of the world wants: a nightly report that missed three nights is one
+ * report, not three. `all` sends one job per missed occurrence, for a schedule whose job does a
+ * piece of work per occurrence that still has to happen.
+ *
+ * Part of the options blob rather than a column of its own: the pass reads every schedule row
+ * anyway, and nothing queries the table by policy.
+ */
+export const SCHEDULE_MISSED_POLICIES = Object.freeze({
+  skip: 'skip',
+  once: 'once',
+  all: 'all'
+} as const)
+
 const QUEUE_DEFAULTS = {
   expire_seconds: FIFTEEN_MINUTES,
   retention_seconds: FORTEEN_DAYS,
@@ -959,8 +981,24 @@ export function trySetQueueDeletionTime (schema: string, queues: string[], secon
   return trySetQueueTimestamp(schema, queues, 'maintain_on', seconds)
 }
 
+// The cron claim, which also answers with the timestamp it replaced. That timestamp is when an
+// instance last ran a pass, so the pass reads it to find out how long scheduling was off, which is
+// the window a schedule's `missed` policy catches up over. Null on a database no pass has ever run
+// against, where there is no gap to catch up on.
+//
+// The prior value has to come from a CTE of its own: RETURNING sees the row as the UPDATE leaves
+// it, while a WITH sub-statement reads the snapshot the whole statement was planned against, so it
+// sees the value the UPDATE is replacing. Zero rows still means another instance holds the claim,
+// which is all the caller checked before.
 export function trySetCronTime (schema: string, seconds: number) {
-  return trySetTimestamp(schema, 'cron_on', seconds)
+  return `
+    WITH prior AS (
+      SELECT cron_on FROM ${schema}.version
+    ), claim AS (
+      ${trySetTimestamp(schema, 'cron_on', seconds)}
+    )
+    SELECT prior.cron_on as "priorCronOn" FROM prior, claim
+  `
 }
 
 export function trySetBamTime (schema: string, seconds: number) {

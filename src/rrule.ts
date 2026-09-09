@@ -332,6 +332,47 @@ function toDate (occurrence: { epochMilliseconds: number }): Date {
 }
 
 /**
+ * The occurrences in `after` to `until`, the lower bound excluded and the upper included, read
+ * backwards from `until` and cut off at `limit` of them. Newest first, since that is the end a
+ * limit has to keep.
+ *
+ * Backwards and bounded, rather than a between() of the whole range, because the range a catch-up
+ * reads is as wide as the gap it covers: a between() over three weeks of a per-second rule
+ * materializes every occurrence in those three weeks to hand back the few the caller will use. The
+ * walk costs what it returns.
+ */
+export function occurrencesBefore (expression: string, after: Date, until: Date, tz: string, limit: number): Date[] {
+  const rule = cachedRule(expression, tz)
+  const occurrences: Date[] = []
+
+  // Inclusive on the first step and exclusive on the rest, which walks each occurrence once from
+  // the upper bound the range includes.
+  let cursor = until
+  let inclusive = true
+
+  while (occurrences.length < limit) {
+    const occurrence = rule.previous(cursor, inclusive)
+
+    if (occurrence === null) {
+      break
+    }
+
+    const date = toDate(occurrence)
+
+    if (date.getTime() <= after.getTime()) {
+      break
+    }
+
+    occurrences.push(date)
+
+    cursor = date
+    inclusive = false
+  }
+
+  return occurrences
+}
+
+/**
  * Rejects an expression or time zone no pass could evaluate, so a schedule that cannot be read is
  * reported to the caller rather than to a warning on every later pass.
  */

@@ -5,7 +5,7 @@ import EventEmitter from 'node:events'
 import * as Attorney from './attorney.ts'
 import type Manager from './manager.ts'
 import * as plans from './plans.ts'
-import { isRrule, nextOccurrence, occurrencesInWindow, assertRrule, assertRruleSends } from './rrule.ts'
+import { isRrule, nextOccurrence, occurrencesBefore, occurrencesInWindow, assertRrule, assertRruleSends } from './rrule.ts'
 import { assertTimezone } from './timezone.ts'
 import { delay } from './tools.ts'
 import * as types from './types.ts'
@@ -29,7 +29,8 @@ const WARNINGS = {
 
 const WARNING_TYPES = {
   CLOCK_SKEW: 'clock_skew',
-  INVALID_SCHEDULE: 'invalid_schedule'
+  INVALID_SCHEDULE: 'invalid_schedule',
+  MISSED_OCCURRENCES_CAPPED: 'missed_occurrences_capped'
 } as const
 
 // previewSchedule() defaults and ceilings. The count ceiling is not a database limit, since the walk
@@ -47,9 +48,12 @@ const PREVIEW_MAX_COUNT = 1000
 const PREVIEW_TIME_BUDGET_MS = 1000
 
 // What the cron pass puts on the send-it queue. `key` identifies the schedule row the occurrence
-// came from, so the handler can record the job it produced. It is absent on rows written by an
-// instance older than 12.31.0, which is why the handler treats it as optional rather than required.
-type ScheduledRequest = types.Request & { key?: string }
+// came from, so the handler can record the job it produced. `slot` is the throttle slot that
+// occurrence was filed in, which is how the handler tells the runs in a catch-up batch apart and
+// records the latest of them. Both are absent on rows written by an instance older than 12.31.0,
+// and `slot` is absent on a cron occurrence in the due window, which the insert files from its own
+// clock, so the handler treats them as optional rather than required.
+type ScheduledRequest = types.Request & { key?: string, slot?: string }
 
 // One schedule occurrence that produced a job, as handed to plans.setScheduleLastJobIds. camelCase
 // to match the recordset column list the plan quotes, which is how every other JSON payload crossing
@@ -61,6 +65,21 @@ type FiredSchedule = { name: string, key: string, jobId: string }
 // same occurrence and send it twice, and a slot wider than the window collapses two occurrences a
 // window apart into one job.
 const OCCURRENCE_WINDOW_SECONDS = 60
+
+// The most occurrences one schedule catches up on in a single pass under `missed: 'all'`.
+//
+// A gap has no natural size: a database resumed after a month owes a per-minute schedule some forty
+// thousand jobs, and creating them is the least of it, since every one of them is then a job a
+// worker has to run. The cap is also what bounds the walk, which is synchronous like the rest of
+// the pass: 1000 occurrences of a dense expression cost around a tenth of a second on the event
+// loop, and a gap ten times wider costs the same.
+//
+// The newest are the ones kept. A schedule catching up on a month has a month of work behind it
+// either way, and the recent end of that is the part still worth doing.
+const MAX_MISSED_OCCURRENCES = 1000
+
+/** The policy names, for the check schedule() performs and the one the pass performs. */
+const MISSED_POLICIES = Object.values(plans.SCHEDULE_MISSED_POLICIES)
 
 // __singletonSlot is an internal field of the insert path rather than a documented send option, so
 // the forwarded job widens JobInsert here rather than the type widening for everyone. The prefix is
@@ -82,6 +101,51 @@ function throttleSlot (instant: Date): string {
   const width = OCCURRENCE_WINDOW_SECONDS * 1000
 
   return new Date(Math.floor(instant.getTime() / width) * width).toISOString().replace('T', ' ').slice(0, 19)
+}
+
+/**
+ * A timestamp column as the driver in front of this instance hands it back: node-postgres parses
+ * one into a Date, and an adapter over a backend that speaks JSON hands back the string it was
+ * sent. Null for anything that is neither, which is what an absent column reads as.
+ */
+function toTime (value: unknown): number | null {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.getTime()
+  }
+
+  if (typeof value === 'string' || typeof value === 'number') {
+    const time = new Date(value).getTime()
+
+    return Number.isNaN(time) ? null : time
+  }
+
+  return null
+}
+
+/**
+ * The catch-up policy a schedule row asks for, which is `skip` for every schedule written before
+ * the option existed: a pass sends what the due window holds and nothing else.
+ *
+ * A value schedule() would have refused can still be on a row, written into the table with SQL or
+ * by a release that names a policy this one does not, and reads as `skip` as well. The pass sends
+ * what it has always sent rather than picking one of the other two on the row's behalf.
+ */
+function missedPolicy (options: types.ScheduleOptions | undefined): types.ScheduleMissedPolicy {
+  const missed = options?.missed
+
+  return missed !== undefined && MISSED_POLICIES.includes(missed)
+    ? missed
+    : plans.SCHEDULE_MISSED_POLICIES.skip
+}
+
+/**
+ * Rejects a catch-up policy no pass would honor, at the one point a caller can be told about it: a
+ * value the pass does not recognize reads as `skip`, so a typo left unchecked here is a schedule
+ * that silently never catches up on anything.
+ */
+function assertMissedPolicy (missed: unknown): void {
+  assert(missed === undefined || MISSED_POLICIES.includes(missed as types.ScheduleMissedPolicy),
+    `missed must be one of: ${MISSED_POLICIES.join(', ')}`)
 }
 
 /**
@@ -273,7 +337,10 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
         const { rows } = await this.db.executeSql(sql)
 
         if (!this.stopped && rows.length === 1) {
-          await this.cron()
+          // The claim answers with the timestamp it replaced, which is when an instance last ran a
+          // pass. Anything older than the due window between then and now is a gap no pass covered,
+          // and a schedule's `missed` policy decides what it owes for it.
+          await this.cron(rows[0].priorCronOn)
         }
       }
     } catch (err) {
@@ -283,7 +350,13 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     }
   }
 
-  async cron () {
+  /**
+   * `priorCronOn` is when an instance last ran a pass, as the claim in onCron() read it off the row
+   * it advanced. Null on a database no pass has run against, and left null by a caller that does
+   * not know: either way no schedule has a gap to catch up on and the pass sends the due window,
+   * which is what every release before catch-up sent.
+   */
+  async cron (priorCronOn: unknown = null) {
     const schedules = await this.getSchedules()
 
     const scheduled: ForwardedJob[] = []
@@ -297,11 +370,25 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     // throttle slot of a forwarded job is measured from the same place its occurrence was.
     const databaseTime = this.databaseTime
 
-    for (const { name, key, data, options, kind, cron, timezone } of schedules) {
+    // Where the due window opens, and with it where a gap ends: an occurrence inside the window is
+    // due now, and one older than it came due while nothing was looking.
+    const windowStart = databaseTime - OCCURRENCE_WINDOW_SECONDS * 1000
+
+    const lastPass = toTime(priorCronOn)
+
+    for (const schedule of schedules) {
+      const { name, key, data, options, kind, cron, timezone } = schedule
+
       let due: DueOccurrences
+      let missed: Date[]
 
       try {
         due = this.dueOccurrences(cron, kind, timezone, databaseTime)
+
+        // In the same try as the due window: both read the same expression, so whatever makes one
+        // unreadable makes the other unreadable, and the row is reported once rather than twice. A
+        // gap closes on the next pass whatever happens here, since the claim has already moved.
+        missed = await this.missedOccurrences(schedule, due.kind, lastPass, windowStart)
       } catch (err) {
         // Evaluating one row must not decide the fate of the others. schedule() now rejects an
         // unusable time zone, but a row written by an earlier release — or straight into the table —
@@ -347,14 +434,33 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
       // counts towards the shifted instant, which lands in the next slot whenever that adds up to a
       // boundary crossing.
       //
+      // A missed occurrence names its slot for that reason and one more: it is older than the
+      // window, so a slot off insert time would file the whole backlog in the slot the pass runs in
+      // and collapse it into a single job. Every slot a missed occurrence names is older than the
+      // slot insert time computes, so none of them can collide with the cron job filed below.
+      //
       // One job per slot rather than one per occurrence, which is the resolution the docs promise:
       // a rule finer than a slot sends a job a slot, and two occurrences inside one window that
       // fall in slots of their own each send.
+      const slots = new Set(missed.map(throttleSlot))
+
       if (due.kind === plans.SCHEDULE_KINDS.rrule) {
-        for (const slot of new Set(due.occurrences.map(throttleSlot))) {
-          scheduled.push({ ...forwarded, __singletonSlot: slot })
+        // Through the set the missed occurrences went through, since the window's lower bound falls
+        // inside a slot rather than on one: an occurrence on the bound is missed, one a millisecond
+        // later is due, and both belong to the same slot and so to the same job.
+        for (const occurrence of due.occurrences) {
+          slots.add(throttleSlot(occurrence))
         }
-      } else if (due.occurrences.length > 0) {
+      }
+
+      for (const slot of slots) {
+        scheduled.push({ ...forwarded, data: { ...forwarded.data, slot }, __singletonSlot: slot })
+      }
+
+      // Anything not read as a rule is read as cron, which is what a row carrying no kind at all
+      // means: the column defaults to cron, and a reader that cannot see it reads the row the way
+      // every release before the column did.
+      if (due.kind !== plans.SCHEDULE_KINDS.rrule && due.occurrences.length > 0) {
         // A cron occurrence keeps the slot every release has always filed it in, since an instance
         // still running an older one during a rolling upgrade computes that slot and nothing else,
         // and a slot the two disagree on collapses nothing.
@@ -412,6 +518,101 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
   }
 
   /**
+   * What a schedule owes for the gap since the last pass, oldest first, as its `missed` policy asks
+   * for it. Empty for every schedule under the default policy, and for every schedule at all in a
+   * deployment whose passes keep running.
+   *
+   * The gap is (lastPass, windowStart]: older than the due window, so no pass has sent it, and
+   * newer than the moment an instance last ran a pass, so no pass has skipped it either. A pass
+   * claims at most `cronMonitorIntervalSeconds` after the one before it, 45 seconds at the
+   * configurable ceiling, against a 60-second window, so the range is empty while passes keep
+   * running and fills up when they stop: a deployment that is down, between deploys, or running
+   * with scheduling switched off.
+   *
+   * Bounded below by the row's own `created_on` as well, so a schedule written during the gap does
+   * not start life owing the occurrences of an expression that was not in the table yet. Not by
+   * `updated_on`, which a deployment calling schedule() on every boot rewrites on the way up: that
+   * would leave the policy with nothing to catch up on in precisely the case it exists for.
+   */
+  private async missedOccurrences (schedule: types.Schedule, kind: types.ScheduleKind, lastPass: number | null, windowStart: number): Promise<Date[]> {
+    const { name, key, cron, timezone, options, createdOn } = schedule
+
+    const policy = missedPolicy(options)
+
+    if (policy === plans.SCHEDULE_MISSED_POLICIES.skip || lastPass === null) {
+      return []
+    }
+
+    const from = Math.max(lastPass, toTime(createdOn) ?? lastPass)
+
+    if (from >= windowStart) {
+      return []
+    }
+
+    // `once` is one job however deep the backlog, which is what a schedule whose job reads the
+    // current state of the world wants: a report that missed three nights is one report.
+    const limit = policy === plans.SCHEDULE_MISSED_POLICIES.once ? 1 : MAX_MISSED_OCCURRENCES
+
+    // One past the limit, so hitting it is told apart from landing on it exactly, and the walk pays
+    // for a single extra occurrence to know which it was.
+    const occurrences = this.readOccurrencesBefore(cron, kind, timezone, new Date(from), new Date(windowStart), limit + 1)
+
+    if (occurrences.length > limit) {
+      occurrences.length = limit
+
+      // Only under `all`, which is the policy that asked for every occurrence and is not getting
+      // them. A deeper backlog under `once` is the policy working as documented.
+      if (policy === plans.SCHEDULE_MISSED_POLICIES.all) {
+        await emitAndPersistWarning(
+          this.warningContext,
+          WARNING_TYPES.MISSED_OCCURRENCES_CAPPED,
+          `Warning: schedule for queue "${name}" (key "${key}") came due more than ${limit} times while no cron pass ran; the ${limit} most recent were sent and the rest dropped.`,
+          { queue: name, key, cron, timezone, limit, since: new Date(from).toISOString() }
+        )
+      }
+    }
+
+    // Chronological, so a backlog reaches the send-it queue in the order it came due. Nothing
+    // downstream promises to run it in that order: the jobs are created by one insert and share a
+    // created_on, so a worker picking two of them up orders them however the fetch does.
+    return occurrences.reverse()
+  }
+
+  /**
+   * The occurrences an expression produces in (after, until], newest first, at most `limit` of
+   * them, read as `kind` says to read it.
+   *
+   * Backwards and bounded rather than a walk forwards over the range: the range is as wide as the
+   * gap it covers, the walk is synchronous like the rest of the pass, and what it costs has to
+   * follow the number of jobs it will send rather than the length of an outage.
+   */
+  private readOccurrencesBefore (expression: string, kind: types.ScheduleKind, tz: string, after: Date, until: Date, limit: number): Date[] {
+    if (kind === plans.SCHEDULE_KINDS.rrule) {
+      return occurrencesBefore(expression, after, until, tz, limit)
+    }
+
+    // cron-parser's prev() answers strictly before its reference date, so the reference is a
+    // millisecond past `until` to leave the upper bound included. That is where the due window's
+    // own lower bound leaves off, and an occurrence exactly on it belongs to one range or the
+    // other, never both.
+    const interval = CronExpressionParser.parse(expression, { tz, strict: false, currentDate: new Date(until.getTime() + 1) })
+
+    const occurrences: Date[] = []
+
+    while (occurrences.length < limit) {
+      const occurrence = interval.prev().toDate()
+
+      if (occurrence.getTime() <= after.getTime()) {
+        break
+      }
+
+      occurrences.push(occurrence)
+    }
+
+    return occurrences
+  }
+
+  /**
    * Every occurrence of an expression inside the due window, read as `kind` says to read it.
    *
    * Due means "an occurrence in the last minute", whatever the pass interval: a pass runs every
@@ -454,14 +655,19 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     // async so a malformed payload rejects its own settlement rather than throwing synchronously
     // out of map() and taking the whole batch with it
     const results = await Promise.allSettled(jobs.map(async ({ data }) => {
-      const { key, ...request } = data
+      // key and slot are the pass's own bookkeeping, read below rather than sent: send() takes the
+      // request the schedule row described and nothing else.
+      const { key, slot, ...request } = data
       return await this.manager.send(request)
     }))
 
-    // Keyed on (name, key) so a batch that spans two minute buckets for the same schedule resolves
-    // to its latest occurrence. Feeding both to the UPDATE would let postgres pick either source
-    // row, and last_job_id could end up naming the older job.
-    const fired = new Map<string, FiredSchedule>()
+    // Keyed on (name, key) so a batch holding more than one occurrence of the same schedule
+    // resolves to its latest. Feeding several to the UPDATE would let postgres pick any of the
+    // source rows, and last_job_id could end up naming an older job. A batch holds more than one
+    // whenever it spans two minute buckets, and a schedule catching up on a gap can put a job per
+    // missed occurrence in it, which the fetch hands over in no particular order: the slot each
+    // occurrence was filed in is what orders them here.
+    const fired = new Map<string, { record: FiredSchedule, slot: string }>()
 
     // Surface any failed forward so a lost cron tick isn't silent
     for (const [index, result] of results.entries()) {
@@ -470,17 +676,30 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
         continue
       }
 
-      const { name, key } = jobs[index].data
+      const { name, key, slot } = jobs[index].data
 
       // send() resolves null when a throttle or queue policy dropped the job, so there is nothing
       // to point last_job_id at. `key` is absent on a payload written by an older instance.
-      if (result.value && key !== undefined) {
-        fired.set(JSON.stringify([name, key]), { name, key, jobId: result.value })
+      if (result.value === null || key === undefined) {
+        continue
+      }
+
+      const id = JSON.stringify([name, key])
+
+      // A cron occurrence in the due window names no slot, since the insert files it from its own
+      // clock. That slot is the one the pass is running in, which is later than every slot a
+      // catch-up occurrence can name, so the current one stands in for it.
+      const filed = slot ?? throttleSlot(new Date(this.databaseTime))
+
+      const latest = fired.get(id)
+
+      if (latest === undefined || latest.slot <= filed) {
+        fired.set(id, { record: { name, key, jobId: result.value }, slot: filed })
       }
     }
 
     if (fired.size > 0) {
-      await this.setLastJobIds([...fired.values()])
+      await this.setLastJobIds([...fired.values()].map(({ record }) => record))
     }
   }
 
@@ -617,7 +836,9 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
   }
 
   async schedule (name: string, cron: string, data?: unknown, options: types.ScheduleOptions = {}): Promise<void> {
-    const { tz = 'UTC', key = '', ...rest } = options
+    // `missed` comes out with tz and key: it tells the pass what to do about a gap and is no more a
+    // send option than they are, so the send-option check below is not handed it.
+    const { tz = 'UTC', key = '', missed, ...rest } = options
 
     // The one place the format of an expression is decided. Every reader takes it from the stored
     // kind instead, so a schedule cannot be validated as one format and later evaluated as the
@@ -637,6 +858,7 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
 
     Attorney.checkSendArgs([name, data, { ...rest }])
     Attorney.assertKey(key)
+    assertMissedPolicy(missed)
 
     try {
       const sql = plans.schedule(this.config.schema)

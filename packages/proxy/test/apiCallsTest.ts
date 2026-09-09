@@ -502,8 +502,8 @@ describe('proxy api routes', () => {
       },
       {
         method: 'schedule',
-        body: { name: 'queue', cron: '* * * * *', data: { a: 1 }, options: { tz: 'UTC' } },
-        expected: ['queue', '* * * * *', { a: 1 }, { tz: 'UTC' }]
+        body: { name: 'queue', cron: '* * * * *', data: { a: 1 }, options: { tz: 'UTC', missed: 'all' } },
+        expected: ['queue', '* * * * *', { a: 1 }, { tz: 'UTC', missed: 'all' }]
       },
       {
         method: 'unschedule',
