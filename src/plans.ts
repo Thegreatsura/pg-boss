@@ -1503,7 +1503,7 @@ function buildFetchParams (options: FetchJobOptions): FetchQueryParams {
 
     if (hasTiers) {
       paramIndex++
-      tiersParam = `$${paramIndex}::jsonb`
+      tiersParam = `$${paramIndex}::text::jsonb`
       values.push(JSON.stringify(groupConcurrencyConfig.tiers))
     }
   }
@@ -1810,7 +1810,7 @@ export function completeJobs (schema: string, table: string, includeQueued?: boo
 export function completeJobsWithOutputs (schema: string, table: string) {
   return `
     WITH input AS (
-      SELECT * FROM json_to_recordset($2::json) AS x (id uuid, output jsonb)
+      SELECT * FROM json_to_recordset($2::text::json) AS x (id uuid, output jsonb)
     ),
     results AS (
       UPDATE ${schema}.${table} j
@@ -1833,7 +1833,7 @@ export function completeJobsWithOutputs (schema: string, table: string) {
 export function completeJobsWithOutputsDistributed (schema: string, table: string) {
   return `
     WITH input AS (
-      SELECT * FROM json_to_recordset($2::json) AS x (id uuid, output jsonb)
+      SELECT * FROM json_to_recordset($2::text::json) AS x (id uuid, output jsonb)
     )
     UPDATE ${schema}.${table} j
     SET completed_on = now(),
@@ -1978,7 +1978,7 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
           WHEN ${isDateTimeString('"startAfter"')} THEN CAST("startAfter" as timestamp with time zone)
           ELSE now() + CAST(COALESCE("startAfter",'0') as interval)
           END as start_after
-      FROM json_to_recordset($1::json) as x (
+      FROM json_to_recordset($1::text::json) as x (
         id uuid,
         priority integer,
         data jsonb,
@@ -2302,7 +2302,7 @@ export function failJobsByIdWithOutputs (schema: string, table: string) {
 
   return `
     WITH output_map AS (
-      SELECT * FROM json_to_recordset($2::json) AS x (id uuid, output jsonb)
+      SELECT * FROM json_to_recordset($2::text::json) AS x (id uuid, output jsonb)
     ),
     ${failJobsBody(schema, table, where, output)}
     SELECT COUNT(*) FROM results
@@ -2317,7 +2317,7 @@ export function deadLetterJobsByIdWithOutputs (schema: string, table: string) {
 
   return `
     WITH output_map AS (
-      SELECT * FROM json_to_recordset($2::json) AS x (id uuid, output jsonb)
+      SELECT * FROM json_to_recordset($2::text::json) AS x (id uuid, output jsonb)
     ),
     ${failJobsBody(schema, table, where, output, true)}
     SELECT COUNT(*) FROM results
@@ -2632,7 +2632,7 @@ export function updateJob (schema: string, table: string, name: string, by: 'id'
     SELECT id FROM upd`
 
   return `
-    WITH o AS (SELECT $1::jsonb AS data),
+    WITH o AS (SELECT $1::text::jsonb AS data),
     target AS (
       SELECT job.id
       FROM ${schema}.${table} job, o
@@ -2958,7 +2958,7 @@ export function insertDependencies (schema: string, deps?: unknown[]) {
   const sql = `
     INSERT INTO ${schema}.job_dependency (child_name, child_id, parent_name, parent_id)
     SELECT child_name, child_id, parent_name, parent_id
-    FROM json_to_recordset($1::json) AS x (
+    FROM json_to_recordset($1::text::json) AS x (
       child_name text,
       child_id uuid,
       parent_name text,
