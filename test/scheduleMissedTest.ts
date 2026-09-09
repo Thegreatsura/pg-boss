@@ -208,11 +208,11 @@ describe('schedule missed', function () {
     // The backwards read widens its steps to reach a sparse expression over a long gap, and a rule
     // that is empty near the window and dense behind it defeats that guess: the steps over the
     // empty stretch grow until one spans more occurrences than rrule-temporal generates in a single
-    // call, and it throws rather than truncating. A per-minute rule whose UNTIL passed three days
+    // call, and it throws rather than truncating. A per-second rule whose UNTIL passed three days
     // before the gap opened is that shape, and the whole catch-up was lost to the warning.
     const cron = [
       `DTSTART:${ical(minute - 400 * DAY)}`,
-      `RRULE:FREQ=MINUTELY;UNTIL=${ical(minute - 3 * DAY)}`
+      `RRULE:FREQ=SECONDLY;UNTIL=${ical(minute - 3 * DAY)}`
     ].join('\n')
 
     const warnings: any[] = []

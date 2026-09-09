@@ -352,9 +352,9 @@ const STEP_GROWTH = 4
  *
  * Widening is a guess about density, and a rule that is empty near `until` and dense further back
  * defeats it: the steps over the empty stretch grow until one spans more occurrences than
- * rrule-temporal will generate in a single call, and it throws rather than truncating. A per-minute
- * rule whose UNTIL passed a few days before the gap opened is that shape, and an ordinary one. So a
- * step that overruns is halved and read again, and the width it overran at becomes a ceiling no
+ * rrule-temporal will generate in a single call, and it throws rather than truncating. A per-second
+ * rule whose UNTIL passed a day or more before the gap opened is that shape, and an ordinary one.
+ * So a step that overruns is halved and read again, and the width it overran at becomes a ceiling no
  * later step goes back over. A step at the floor that still overruns is the expression rather than
  * the width, and the caller hears about it instead.
  *
