@@ -1128,12 +1128,18 @@ export function deleteAllJobs (schema: string, table: string) {
 
 // Named and aliased rather than SELECT *, so the timestamp columns and last_job_id reach callers
 // in the same camelCase shape every other read in the API uses.
+//
+// The zone is coalesced because the column is nullable and Schedule.timezone is not: schedule()
+// stores 'UTC' for a zone it was not given, and the v41 migration retires the nulls already in the
+// table, but an instance on an older release can still write one during a rolling upgrade, and a
+// row written with SQL can leave it out. Null read back as null would evaluate in the host's local
+// zone, which no caller ever asked for and which differs between instances.
 const SCHEDULE_COLUMNS = `
   name,
   key,
   kind,
   cron,
-  timezone,
+  COALESCE(timezone, 'UTC') as timezone,
   data,
   options,
   created_on as "createdOn",
@@ -1179,13 +1185,19 @@ export function setScheduleLastJobIds (schema: string) {
  *
  * `updated_on` is deliberately untouched: it tracks edits to the definition, and a relabel is the
  * pass agreeing with what the row already said, not a change to what the schedule does.
+ *
+ * Matched on the expression as well as the primary key, so a schedule() upsert landing between the
+ * pass's read and this write keeps the kind it was stored with instead of being stamped with the
+ * previous expression's. A row that misses the update because it changed underneath is relabelled
+ * by the next pass if it still needs it.
  */
 export function setScheduleKinds (schema: string) {
   return `
     UPDATE ${schema}.schedule s SET kind = k.kind
-    FROM json_to_recordset($1::json) as k (name text, key text, kind text)
+    FROM json_to_recordset($1::json) as k (name text, key text, kind text, cron text)
     WHERE s.name = k.name
       AND COALESCE(s.key, '') = k.key
+      AND s.cron = k.cron
   `
 }
 
@@ -2025,9 +2037,13 @@ interface InsertJobsOptions {
   name: string
   returnId?: boolean
   notify?: boolean
+  // Whether a job may name the throttle slot it is filed in. Only the cron pass asks for it, so the
+  // statement a public insert() builds does not declare the column and a caller naming it sets
+  // nothing. See the CASE below.
+  slots?: boolean
 }
 
-export function insertJobs (schema: string, { table, name, returnId = true, notify = false }: InsertJobsOptions) {
+export function insertJobs (schema: string, { table, name, returnId = true, notify = false, slots = false }: InsertJobsOptions) {
   // When notify is enabled we always RETURN start_after so the wrapper below can gate
   // the NOTIFY on immediate availability, regardless of whether the caller wants ids.
   const returning = notify ? 'RETURNING id, start_after' : returnId ? 'RETURNING id' : ''
@@ -2067,12 +2083,13 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
       CASE
         -- A caller that knows the slot names it outright: the cron pass files a rule occurrence in
         -- the slot the occurrence falls in, and an offset off now() cannot pin that, since now()
-        -- here is insert time. Prefixed because insert() stringifies caller objects straight into
-        -- the recordset below, so an ordinary name would be a live, undeclared and unvalidated
-        -- option on the public path, where a bad value surfaces as a raw postgres error. Not called
-        -- singletonOn either, which is a column fetching a job hands back, so a job read from one
-        -- queue and inserted into another cannot fill it in by accident.
-        WHEN "__singletonSlot" IS NOT NULL THEN CAST("__singletonSlot" as timestamp)
+        -- here is insert time. Only in the statement the pass asks for, because insert()
+        -- stringifies caller objects straight into the recordset below, so a column declared for
+        -- everyone would be a live, undeclared and unvalidated option on the public path, where a
+        -- bad value surfaces as a raw postgres error. Prefixed as well, and not called singletonOn,
+        -- which is a column fetching a job hands back, so a job read from one queue and inserted
+        -- into another cannot fill it in by accident.
+        ${slots ? 'WHEN "__singletonSlot" IS NOT NULL THEN CAST("__singletonSlot" as timestamp)' : ''}
         WHEN "singletonSeconds" IS NOT NULL THEN 'epoch'::timestamp + '1s'::interval * ("singletonSeconds"::float8 * floor(( date_part('epoch', now()) + COALESCE("singletonOffset",0)::float8) / "singletonSeconds"::float8 ))
         ELSE NULL
         END as singleton_on,
@@ -2109,7 +2126,7 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
         "singletonKey" text,
         "singletonSeconds" integer,
         "singletonOffset" integer,
-        "__singletonSlot" text,
+        ${slots ? '"__singletonSlot" text,' : ''}
         "groupId" text,
         "groupTier" text,
         "expireInSeconds" integer,

@@ -163,11 +163,15 @@ const scheduleQuerySchema = z.object({
 // previewSchedule maps onto PreviewScheduleOptions. GET params arrive as strings, so `from`
 // transforms to the Date the option expects and `count` coerces; both are optional, as is `tz`, so
 // an omitted param leaves the method's own default in place.
+//
+// The count ceiling mirrors the method's own, so a count past it is a 400 naming the parameter
+// rather than a 500 carrying the assertion text, and the generated OpenAPI parameter says what the
+// limit is instead of leaving a client to find it by being refused.
 const previewScheduleQuerySchema = z.object({
   cron: z.string().min(1),
   tz: z.string().optional(),
   from: z.iso.datetime().transform((v) => new Date(v)).optional(),
-  count: z.coerce.number().int().positive().optional()
+  count: z.coerce.number().int().positive().max(1000).optional()
 })
 
 const findJobsQuerySchema = z.object({

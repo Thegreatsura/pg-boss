@@ -1,6 +1,7 @@
 import { delay } from '../src/tools.ts'
 import { expect } from 'vitest'
 import * as helper from './testHelper.ts'
+import * as plans from '../src/plans.ts'
 import { PgBoss } from '../src/index.ts'
 import { ctx } from './hooks.ts'
 
@@ -39,10 +40,14 @@ async function waitForLastJobIds (boss: PgBoss, count: number) {
 async function setLastJobId (key: string, jobId: string) {
   const db = await helper.getDb()
 
-  await db.executeSql(
-    `UPDATE ${ctx.schema}.schedule SET last_job_id = $1 WHERE name = $2 AND COALESCE(key, '') = $3`,
-    [jobId, ctx.schema, key]
-  )
+  try {
+    await db.executeSql(
+      `UPDATE ${ctx.schema}.schedule SET last_job_id = $1 WHERE name = $2 AND COALESCE(key, '') = $3`,
+      [jobId, ctx.schema, key]
+    )
+  } finally {
+    await db.close()
+  }
 }
 
 describe('schedule lastJobId', function () {
@@ -132,5 +137,59 @@ describe('schedule lastJobId', function () {
 
     expect(schedule.createdOn).toBeInstanceOf(Date)
     expect(schedule.updatedOn).toBeInstanceOf(Date)
+  })
+
+  it('leaves updatedOn alone when a schedule fires', async function () {
+    ctx.boss = await helper.start(firingConfig())
+
+    await ctx.boss.schedule(ctx.schema, '* * * * *')
+
+    const [before] = await ctx.boss.getSchedules()
+
+    const [after] = await waitForLastJobIds(ctx.boss, 1)
+
+    // updated_on tracks edits to the definition, and a firing schedule has not been edited: an
+    // operator watching the column has to be able to tell "somebody changed this" from "this ran".
+    // Documented in three places and asserted here, on the write that could break it.
+    expect(after.updatedOn.getTime()).toBe(before.updatedOn.getTime())
+    expect(after.lastJobId).toBeTruthy()
+  })
+
+  it('leaves updatedOn alone when a pass relabels the format a row is in', async function () {
+    ctx.boss = await helper.start({ ...ctx.bossConfig, schedule: false })
+
+    await ctx.boss.schedule(ctx.schema, '0 3 * * *')
+
+    const [before] = await ctx.boss.getSchedules()
+
+    const db = await helper.getDb()
+
+    try {
+      // The relabel the pass performs for a row whose stored kind disagrees with its expression.
+      // Also not an edit: the pass is agreeing with what the row already said.
+      await db.executeSql(
+        plans.setScheduleKinds(ctx.schema),
+        [JSON.stringify([{ name: ctx.schema, key: '', kind: 'rrule', cron: '0 3 * * *' }])]
+      )
+
+      const [after] = await ctx.boss.getSchedules()
+
+      expect(after.kind).toBe('rrule')
+      expect(after.updatedOn.getTime()).toBe(before.updatedOn.getTime())
+
+      // And a relabel judged against an expression the row no longer holds does not land at all: a
+      // schedule() upsert between the pass's read and its write would otherwise be stamped with
+      // the kind of the expression it just replaced.
+      await db.executeSql(
+        plans.setScheduleKinds(ctx.schema),
+        [JSON.stringify([{ name: ctx.schema, key: '', kind: 'cron', cron: 'FREQ=DAILY;BYHOUR=3' }])]
+      )
+
+      const [unchanged] = await ctx.boss.getSchedules()
+
+      expect(unchanged.kind).toBe('rrule')
+    } finally {
+      await db.close()
+    }
   })
 })

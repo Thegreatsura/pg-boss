@@ -70,9 +70,13 @@ const OCCURRENCE_WINDOW_SECONDS = 60
 //
 // A gap has no natural size: a database resumed after a month owes a per-minute schedule some forty
 // thousand jobs, and creating them is the least of it, since every one of them is then a job a
-// worker has to run. The cap is also what bounds the walk, which is synchronous like the rest of
-// the pass: 1000 occurrences of a dense expression cost around a tenth of a second on the event
-// loop, and a gap ten times wider costs the same.
+// worker has to run. Once created they reach their queue at the rate the send-it worker forwards
+// them, 50 a poll on cronWorkerIntervalSeconds, so a capped backlog takes something like twenty
+// seconds at the default of a second to turn into real jobs.
+//
+// The cap is also what bounds the read, which is synchronous like the rest of the pass, though not
+// by much: 1000 occurrences measured 1 to 4ms as a rule and 5 to 16ms as a cron expression, and a
+// gap ten times wider costs the same, since both formats are read backwards from the window.
 //
 // The newest are the ones kept. A schedule catching up on a month has a month of work behind it
 // either way, and the recent end of that is the part still worth doing.
@@ -81,11 +85,33 @@ const MAX_MISSED_OCCURRENCES = 1000
 /** The policy names, for the check schedule() performs and the one the pass performs. */
 const MISSED_POLICIES = Object.values(plans.SCHEDULE_MISSED_POLICIES)
 
-// __singletonSlot is an internal field of the insert path rather than a documented send option, so
-// the forwarded job widens JobInsert here rather than the type widening for everyone. The prefix is
-// what keeps it internal: insert() stringifies caller objects straight into the recordset, so an
-// unprefixed name would be a live, undeclared option on the public path.
+// __singletonSlot is an internal field of the pass's own insert rather than a documented send
+// option, so the forwarded job widens JobInsert here rather than the type widening for everyone.
+// A public insert() neither declares the column in the statement it builds nor keeps the field on
+// the objects it is handed, so naming it there sets nothing. The pass asks for it with the
+// __singletonSlots option it passes beside the jobs.
 type ForwardedJob = types.JobInsert & { __singletonSlot?: string }
+
+/**
+ * The singleton key a forwarded occurrence is filed under, which is what keeps two instances
+ * sending the same occurrence from creating two jobs.
+ *
+ * The name's own underscores are escaped rather than the pair concatenated raw: underscores are
+ * legal in both halves, so `${name}__${key}` collapsed ('report_', 'daily') and ('report', '_daily')
+ * onto one key and the 60-second singleton then dropped whichever occurrence lost the race. With
+ * the name escaped the first unescaped underscore can only be the separator, so the pair is
+ * recoverable from the string, and `\` is outside the charset assertObjectName and assertKey allow
+ * on either half, so the escape cannot collide with a name that contains one.
+ *
+ * A JSON pair would be injective too, and different from the key every release before this one
+ * wrote for every schedule there is. The two formats do not collide with each other, so a rolling
+ * upgrade would put an old pass and a new pass on the same occurrence and both jobs would survive
+ * the singleton. This form is byte-identical to the old key for every name that carries no
+ * underscore, so the only keys that move are the ones already colliding today.
+ */
+function occurrenceKey (name: string, key: string): string {
+  return `${name.replaceAll('_', '\\_')}__${key}`
+}
 
 /** What a schedule has come due for, and the format its expression was read in to find out. */
 type DueOccurrences = { kind: types.ScheduleKind, occurrences: Date[] }
@@ -144,7 +170,11 @@ function missedPolicy (options: types.ScheduleOptions | undefined): types.Schedu
  * that silently never catches up on anything.
  */
 function assertMissedPolicy (missed: unknown): void {
-  assert(missed === undefined || MISSED_POLICIES.includes(missed as types.ScheduleMissedPolicy),
+  // Nullish is "no policy named", which is the default, for the same reason a falsy `tz` is UTC: a
+  // value threaded out of a config object or a database column arrives as null rather than absent,
+  // and a policy name is never falsy, so nothing a caller could have meant is being read past. The
+  // row keeps whatever it was given, and the pass reads it as `skip` either way.
+  assert(missed === undefined || missed === null || MISSED_POLICIES.includes(missed as types.ScheduleMissedPolicy),
     `missed must be one of: ${MISSED_POLICIES.join(', ')}`)
 }
 
@@ -363,8 +393,10 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     const stillBroken = new Set<string>()
 
     // Rows whose stored kind disagrees with the expression on them, as found out by reading the
-    // expression the other way. Relabelled once the pass has sent what it owes.
-    const relabelled: Array<Pick<types.Schedule, 'name' | 'key' | 'kind'>> = []
+    // expression the other way. Relabelled once the pass has sent what it owes, and each carries
+    // the expression the label was read off, since a schedule() upsert landing between this pass's
+    // read and its write would otherwise be stamped with the previous expression's kind.
+    const relabelled: Array<Pick<types.Schedule, 'name' | 'key' | 'kind' | 'cron'>> = []
 
     // One instant for the whole pass, so every schedule is judged against the same clock and the
     // throttle slot of a forwarded job is measured from the same place its occurrence was.
@@ -379,52 +411,56 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     for (const schedule of schedules) {
       const { name, key, data, options, kind, cron, timezone } = schedule
 
+      // Reports a row the pass could not read, once per (name, key, expression, zone) rather than
+      // once per pass: an unusable schedule never heals on its own, so warning every pass would
+      // persist a row every cronMonitorIntervalSeconds forever.
+      const warned = JSON.stringify([name, key, cron, timezone])
+
+      const warn = async (message: string) => {
+        stillBroken.add(warned)
+
+        if (!this.warnedSchedules.has(warned)) {
+          await emitAndPersistWarning(this.warningContext, WARNING_TYPES.INVALID_SCHEDULE, message, { queue: name, key, cron, timezone })
+        }
+      }
+
       let due: DueOccurrences
-      let missed: Date[]
 
       try {
         due = this.dueOccurrences(cron, kind, timezone, databaseTime)
-
-        // In the same try as the due window: both read the same expression, so whatever makes one
-        // unreadable makes the other unreadable, and the row is reported once rather than twice. A
-        // gap closes on the next pass whatever happens here, since the claim has already moved.
-        missed = await this.missedOccurrences(schedule, due.kind, lastPass, windowStart)
       } catch (err) {
         // Evaluating one row must not decide the fate of the others. schedule() now rejects an
-        // unusable time zone, but a row written by an earlier release — or straight into the table —
+        // unusable time zone, but a row written by an earlier release, or straight into the table,
         // still throws here. This was a single filter() over every schedule, so one such row
         // propagated out of cron() and silently stopped scheduling for every queue in the
         // deployment, on every pass, until someone found the row. Skip it and warn instead, naming
         // the schedule so it is actually fixable.
-        const warned = JSON.stringify([name, key, cron, timezone])
-
-        stillBroken.add(warned)
-
-        if (!this.warnedSchedules.has(warned)) {
-          await emitAndPersistWarning(
-            this.warningContext,
-            WARNING_TYPES.INVALID_SCHEDULE,
-            `Warning: schedule for queue "${name}" (key "${key}") could not be evaluated and was skipped: ${(err as Error).message}`,
-            { queue: name, key, cron, timezone }
-          )
-        }
+        await warn(`Warning: schedule for queue "${name}" (key "${key}") could not be evaluated and was skipped: ${(err as Error).message}`)
 
         continue
       }
 
+      let missed: Date[] = []
+
+      try {
+        missed = await this.missedOccurrences(schedule, due.kind, lastPass, windowStart)
+      } catch (err) {
+        // Its own try, so a catch-up that cannot be read does not cost the occurrence that is due
+        // now. It is the same expression, but over a range as wide as the outage rather than a
+        // minute, and the width is what can fail on its own: cron-parser gives up walking a sparse
+        // expression far enough back. The gap closes on the next pass whatever happens here, since
+        // the claim has already moved, so the backlog is gone rather than deferred, which is why
+        // this warns rather than passing over it.
+        await warn(`Warning: schedule for queue "${name}" (key "${key}") could not be caught up on the gap since the last cron pass: ${(err as Error).message}`)
+      }
+
       if (due.kind !== kind) {
-        relabelled.push({ name, key, kind: due.kind })
+        relabelled.push({ name, key, kind: due.kind, cron })
       }
 
       // The payload carries the schedule's key beside its queue name, so the send-it handler knows
       // which row an occurrence came from and can record the job it produced.
-      //
-      // A JSON singleton key rather than `${name}__${key}`: underscores are legal in both a queue
-      // name and a schedule key, so the concatenation collapsed ('report_', 'daily') and
-      // ('report', '_daily') onto one key and the 60s singleton then dropped whichever occurrence
-      // lost the race. An instance still on the old format writes the old key, so a mixed-version
-      // deployment can fire a schedule twice in the minute the rollout straddles.
-      const forwarded = { data: { name, key, data, options }, singletonKey: JSON.stringify([name, key]) }
+      const forwarded = { data: { name, key, data, options }, singletonKey: occurrenceKey(name, key) }
 
       // A recurrence rule can put an occurrence anywhere in the minute, and a slot measured from
       // insert time would then straddle it: two passes on either side of a slot boundary both find
@@ -471,7 +507,7 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     this.warnedSchedules = stillBroken
 
     if (scheduled.length > 0 && !this.stopped) {
-      await this.manager.insert(QUEUES.SEND_IT, scheduled)
+      await this.manager.insert(QUEUES.SEND_IT, scheduled, { __singletonSlots: true })
     }
 
     // After the sends, so a failed relabel cannot cost an occurrence. Nothing depends on the write:
@@ -800,7 +836,13 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
    * job lands at or shortly after each listed time.
    */
   previewSchedule (cron: string, options: types.PreviewScheduleOptions = {}): Date[] {
-    const { tz = 'UTC', count = PREVIEW_DEFAULT_COUNT } = options
+    const { count = PREVIEW_DEFAULT_COUNT } = options
+
+    // Falsy is UTC here for the reason it is in schedule(), and for one more: the documented recipe
+    // for previewing a stored schedule passes `schedule.timezone` straight in, and that column is
+    // nullable, so a row written before schedule() validated zones would otherwise throw on the
+    // read path rather than preview the zone the pass evaluates it in.
+    const tz = options.tz || 'UTC'
 
     const from = options.from ?? new Date(this.databaseTime)
 
@@ -838,7 +880,15 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
   async schedule (name: string, cron: string, data?: unknown, options: types.ScheduleOptions = {}): Promise<void> {
     // `missed` comes out with tz and key: it tells the pass what to do about a gap and is no more a
     // send option than they are, so the send-option check below is not handed it.
-    const { tz = 'UTC', key = '', missed, ...rest } = options
+    const { tz: requestedTz, key = '', missed, ...rest } = options
+
+    // Any falsy zone is "none specified", not a zone to be judged: a destructuring default only
+    // covers `undefined`, and a value threaded out of a config object or read back off the nullable
+    // timezone column arrives as null. Coalescing it here is what keeps the two engines from
+    // disagreeing about what it meant, since cron-parser reads a non-string zone as unset and
+    // evaluates in the host's local zone while rrule-temporal refuses it outright. A truthy zone
+    // the parser rejects still throws.
+    const tz = requestedTz || 'UTC'
 
     // The one place the format of an expression is decided. Every reader takes it from the stored
     // kind instead, so a schedule cannot be validated as one format and later evaluated as the

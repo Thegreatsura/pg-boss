@@ -820,6 +820,11 @@ describe('migration', function () {
       await store('rule', 'FREQ=DAILY;BYHOUR=3')
       await store('block', 'DTSTART:20260901T090000Z\nRRULE:FREQ=WEEKLY;BYDAY=MO')
 
+      // And a row whose zone was never stored, which is what `schedule({ tz: null })` wrote before
+      // a falsy zone read as "none given".
+      await db.executeSql(
+        `INSERT INTO ${schema}.schedule (name, key, cron, timezone) VALUES ('sched_q', 'zoneless', '0 3 * * *', NULL)`)
+
       await contractor.migrate(40)
       expect(await contractor.schemaVersion()).toBe(currentSchemaVersion)
 
@@ -827,8 +832,20 @@ describe('migration', function () {
       expect(rows).toEqual([
         { key: 'block', kind: 'rrule' },
         { key: 'nightly', kind: 'cron' },
-        { key: 'rule', kind: 'rrule' }
+        { key: 'rule', kind: 'rrule' },
+        { key: 'zoneless', kind: 'cron' }
       ])
+
+      // The zone a row never carried. Nothing chose it: schedule()'s default is UTC and the docs
+      // say UTC, but a destructuring default only covers `undefined`, so `schedule({ tz: null })`
+      // left the column null and cron-parser then evaluated the row in the local zone of whichever
+      // instance took the pass. The backfill is what makes Schedule.timezone the string its type
+      // says it is.
+      const { rows: zones } = await db.executeSql(`SELECT count(*)::int as nulls FROM ${schema}.schedule WHERE timezone IS NULL`)
+      expect(zones[0].nulls).toBe(0)
+
+      const { rows: backfilled } = await db.executeSql(`SELECT timezone FROM ${schema}.schedule WHERE key = 'zoneless'`)
+      expect(backfilled[0].timezone).toBe('UTC')
 
       // And the kind a row cannot be: the column carries the two formats pg-boss evaluates, so a
       // value nothing reads is refused rather than stored and silently treated as cron.

@@ -449,11 +449,16 @@ describe('schedule', function () {
     await ctx.boss.createQueue(broken)
 
     const db = await helper.getDb()
-    await db.executeSql(
-      `INSERT INTO ${ctx.schema}.schedule (name, key, cron, timezone, data, options)
-       VALUES ($1, '', '* * * * *', 'Mars/Phobos', null, '{}'::jsonb)`,
-      [broken]
-    )
+
+    try {
+      await db.executeSql(
+        `INSERT INTO ${ctx.schema}.schedule (name, key, cron, timezone, data, options)
+         VALUES ($1, '', '* * * * *', 'Mars/Phobos', null, '{}'::jsonb)`,
+        [broken]
+      )
+    } finally {
+      await db.close()
+    }
 
     // Poll rather than sleeping a fixed 4s: the chain is cron pass -> send-it insert -> send-it
     // worker -> fetch, and a fixed sleep is both slower in the common case and short on margin
@@ -693,6 +698,28 @@ describe('timekeeper clock domain', function () {
     await expect(tk.schedule('q', '* * * * *')).resolves.toBeUndefined()
   })
 
+  it('schedule() reads a falsy time zone as none given rather than refusing it', async function () {
+    const tk = makeTk(0)
+    const db = (tk as any).db
+
+    // A destructuring default only covers `undefined`, so a zone threaded out of a config object or
+    // read back off the nullable timezone column arrives here as null. Every one of these was
+    // accepted before zones were validated, and what the author meant by all of them is documented
+    // as UTC, so the row is stored with the zone the docs promise instead of throwing on a value
+    // that used to work.
+    for (const tz of [null, undefined, '', 0]) {
+      await expect(tk.schedule('q', '* * * * *', null, { tz } as any)).resolves.toBeUndefined()
+
+      const { values } = db.executed[db.executed.length - 1]
+
+      expect(values[4]).toBe('UTC')
+    }
+
+    // A zone that says something, and says something unusable, still throws.
+    await expect(tk.schedule('q', '* * * * *', null, { tz: 'Mars/Phobos' })).rejects.toThrow(/time zone/i)
+    await expect(tk.schedule('q', '* * * * *', null, { tz: {} } as any)).rejects.toThrow(/time zone/i)
+  })
+
   it('one unusable schedule row does not stop every other schedule from firing', async function () {
     const tk = makeTk(0)
     ;(tk as any).stopped = false
@@ -716,7 +743,7 @@ describe('timekeeper clock domain', function () {
     await tk.cron()
 
     expect(inserted.length).toBe(1)
-    expect(inserted[0].singletonKey).toBe('["healthy",""]')
+    expect(inserted[0].singletonKey).toBe('healthy__')
 
     // and the operator has to be told which schedule is broken, or it stays invisible
     expect(warnings.length).toBe(1)
@@ -730,20 +757,26 @@ describe('timekeeper clock domain', function () {
     const inserted: any[] = []
     ;(tk as any).manager = { insert: async (_q: string, jobs: any[]) => { inserted.push(...jobs) } }
 
-    // Underscores are legal in both a queue name and a schedule key, so `${name}__${key}` handed
-    // these two rows the same singleton key and the 60s window dropped whichever lost the race:
-    // one schedule never fired, and so never recorded a last job id either.
+    // Underscores are legal in both a queue name and a schedule key, so the raw `${name}__${key}`
+    // handed these two rows the same singleton key and the 60s window dropped whichever lost the
+    // race: one schedule never fired, and so never recorded a last job id either.
     ;(tk as any).getSchedules = async () => ([
       { name: 'report_', key: 'daily', data: null, options: {}, cron: '* * * * *', timezone: 'UTC' },
-      { name: 'report', key: '_daily', data: null, options: {}, cron: '* * * * *', timezone: 'UTC' }
+      { name: 'report', key: '_daily', data: null, options: {}, cron: '* * * * *', timezone: 'UTC' },
+      { name: 'report', key: 'daily', data: null, options: {}, cron: '* * * * *', timezone: 'UTC' }
     ])
 
     await tk.cron()
 
     const keys = inserted.map(({ singletonKey }) => singletonKey)
 
-    expect(keys.length).toBe(2)
-    expect(new Set(keys).size).toBe(2)
+    expect(keys.length).toBe(3)
+    expect(new Set(keys).size).toBe(3)
+
+    // And the key is what every release has written for a name carrying no underscore, which is
+    // what keeps a rolling upgrade from filing one occurrence twice: only the pairs that already
+    // collide today move.
+    expect(keys).toContain('report__daily')
   })
 
   it('an unusable schedule row warns once, not on every pass', async function () {

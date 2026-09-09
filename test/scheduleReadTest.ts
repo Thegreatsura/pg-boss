@@ -154,13 +154,24 @@ describe('previewSchedule', function () {
     expect(() => tk.previewSchedule('* * * * *', { tz: 'Mars/Phobos' })).toThrow(/time zone/)
   })
 
-  it('should reject a time zone cron-parser would read as unset', function () {
+  it('should read a falsy time zone as UTC rather than as the host zone', function () {
     const tk = makeTk()
 
+    const utc = tk.previewSchedule('0 3 * * *', { tz: 'UTC', from: new Date('2026-03-01T00:00:00Z'), count: 2 })
+
     // schedule.timezone is nullable, so a row written before schedule() validated zones reads back
-    // as null. cron-parser takes that for "no zone" and evaluates in the host's local zone, which
-    // is a wrong answer rather than a failure.
-    expect(() => tk.previewSchedule('0 3 * * *', { tz: null as unknown as string })).toThrow(/time zone/)
+    // as null, and so does a zone threaded out of a config object. cron-parser takes a non-string
+    // zone for "no zone" and evaluates in the host's local zone, which is a wrong answer rather
+    // than a failure: whichever instance ran the pass decided when the job went out. Falsy means
+    // "none given", which is documented as UTC, so the two agree here and in the pass.
+    for (const tz of [null, undefined, '', 0]) {
+      const occurrences = tk.previewSchedule('0 3 * * *', { tz, from: new Date('2026-03-01T00:00:00Z'), count: 2 } as any)
+
+      expect(occurrences.map(d => d.toISOString())).toEqual(utc.map(d => d.toISOString()))
+    }
+
+    // A zone that says something unusable still throws
+    expect(() => tk.previewSchedule('0 3 * * *', { tz: {} as any })).toThrow(/time zone/)
   })
 
   it('should reject a count outside the supported range', function () {
@@ -268,6 +279,38 @@ describe('previewSchedule of a stored schedule', function () {
       '2026-03-01T09:00:00.000Z',
       '2026-03-02T09:00:00.000Z'
     ])
+  })
+
+  it('should preview a legacy row whose time zone was never stored', async function () {
+    ctx.boss = await helper.start({ ...ctx.bossConfig })
+
+    await ctx.boss.createQueue('legacy')
+
+    const db = await helper.getDb()
+
+    try {
+      // The row `schedule({ tz: null })` wrote on a release whose destructuring default only
+      // covered `undefined`. The v41 migration retires the ones already in the table, and the read
+      // coalesces whatever an older instance writes during a rolling upgrade, so Schedule.timezone
+      // is the string its type says it is and the documented recipe below previews rather than
+      // throwing.
+      await db.executeSql(`INSERT INTO ${ctx.schema}.schedule (name, key, cron, timezone) VALUES ('legacy', '', '0 3 * * *', NULL)`)
+    } finally {
+      await db.close()
+    }
+
+    const schedule = await ctx.boss.getSchedule('legacy')
+
+    helper.assertTruthy(schedule)
+    expect(schedule.timezone).toBe('UTC')
+
+    const occurrences = ctx.boss.previewSchedule(schedule.cron, {
+      tz: schedule.timezone,
+      from: new Date('2026-03-01T00:00:00Z'),
+      count: 1
+    })
+
+    expect(occurrences.map(d => d.toISOString())).toEqual(['2026-03-01T03:00:00.000Z'])
   })
 
   it('should read a stored rule without being told which format it is in', async function () {

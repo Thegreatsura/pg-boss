@@ -332,41 +332,50 @@ function toDate (occurrence: { epochMilliseconds: number }): Date {
 }
 
 /**
- * The occurrences in `after` to `until`, the lower bound excluded and the upper included, read
- * backwards from `until` and cut off at `limit` of them. Newest first, since that is the end a
- * limit has to keep.
+ * How wide the first backwards chunk of a catch-up read is, and the factor each one after it grows
+ * by. An hour fills the cap outright for anything denser than a job a second, and four steps of
+ * growth reach a month, so a sparse expression over a long outage is read in a handful of calls.
+ */
+const CHUNK_SECONDS = 60 * 60
+const CHUNK_GROWTH = 4
+
+/**
+ * The occurrences in `after` to `until`, the lower bound excluded and the upper included, newest
+ * first and at most `limit` of them.
  *
- * Backwards and bounded, rather than a between() of the whole range, because the range a catch-up
- * reads is as wide as the gap it covers: a between() over three weeks of a per-second rule
- * materializes every occurrence in those three weeks to hand back the few the caller will use. The
- * walk costs what it returns.
+ * Read in chunks that widen backwards from `until` rather than in one between() over the whole
+ * range, because the range a catch-up reads is as wide as the gap it covers: a single between()
+ * over three weeks of a per-second rule materializes every occurrence in those three weeks to hand
+ * back the few the caller will use. A dense expression fills the limit out of the first chunk, and
+ * a sparse one reaches `after` in a few steps, since each chunk is four times the last. Either way
+ * the walk costs what it returns rather than what the gap spans.
+ *
+ * Deliberately not rrule-temporal's previous(). That walks backwards from a phase-aligned DTSTART,
+ * and an RDATE is an absolute instant rather than a phase, so a rule carrying one answers with the
+ * RDATE in place of the rule occurrence that follows it and loses every occurrence in between.
+ * between() has no such problem, and it is what the due window has always read.
  */
 export function occurrencesBefore (expression: string, after: Date, until: Date, tz: string, limit: number): Date[] {
   const rule = cachedRule(expression, tz)
   const occurrences: Date[] = []
 
-  // Inclusive on the first step and exclusive on the rest, which walks each occurrence once from
-  // the upper bound the range includes.
-  let cursor = until
-  let inclusive = true
+  let upper = until
+  let width = CHUNK_SECONDS * 1000
 
-  while (occurrences.length < limit) {
-    const occurrence = rule.previous(cursor, inclusive)
+  while (occurrences.length < limit && upper.getTime() > after.getTime()) {
+    const lower = new Date(Math.max(after.getTime(), upper.getTime() - width))
 
-    if (occurrence === null) {
-      break
+    // between() excludes both ends. The upper bound is nudged past so an occurrence on it is
+    // included, and the lower one stays excluded because it is the next chunk's upper bound, which
+    // is also what leaves the range's own lower bound, `after`, excluded.
+    const chunk = rule.between(lower, new Date(upper.getTime() + 1))
+
+    for (let index = chunk.length - 1; index >= 0 && occurrences.length < limit; index--) {
+      occurrences.push(toDate(chunk[index]!))
     }
 
-    const date = toDate(occurrence)
-
-    if (date.getTime() <= after.getTime()) {
-      break
-    }
-
-    occurrences.push(date)
-
-    cursor = date
-    inclusive = false
+    upper = lower
+    width *= CHUNK_GROWTH
   }
 
   return occurrences

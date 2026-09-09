@@ -654,6 +654,17 @@ describe('proxy api routes', () => {
     expect(res.status).toBe(400)
   })
 
+  it('GET previewSchedule rejects a count past the method ceiling', async () => {
+    const { boss } = createBossMock()
+    const { app } = await createProxyService({ options: {}, bossFactory: () => boss as any })
+
+    // The method asserts the same ceiling, so without it here the refusal arrives as a 500 built
+    // out of assertion text rather than a 400 naming the parameter.
+    const req = new Request('http://local/api/previewSchedule?cron=0+3+*+*+*&count=1001', { method: 'GET' })
+    const res = await app.fetch(req)
+    expect(res.status).toBe(400)
+  })
+
   it('rejects oversized request bodies', async () => {
     const { boss } = createBossMock()
     const { app } = await createProxyService({ options: {}, bossFactory: () => boss as any, bodyLimit: 100 })

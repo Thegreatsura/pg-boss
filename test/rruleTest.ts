@@ -2,7 +2,7 @@ import { expect } from 'vitest'
 import { delay } from '../src/tools.ts'
 import * as helper from './testHelper.ts'
 import Timekeeper from '../src/timekeeper.ts'
-import { isRrule, nextOccurrence, assertRrule, assertRruleSends } from '../src/rrule.ts'
+import { isRrule, nextOccurrence, occurrencesBefore, occurrencesInWindow, assertRrule, assertRruleSends } from '../src/rrule.ts'
 import { ctx } from './hooks.ts'
 
 // Most of this needs no database: an expression is read by a pure function of (expression, after,
@@ -342,6 +342,62 @@ describe('rrule', function () {
     expect(() => assertRrule('FREQ=NOPE', 'America/New_Yrok')).toThrow(/Invalid FREQ value/)
   })
 
+  it('reads a range backwards the way the due window reads it forwards', function () {
+    const hour = Date.UTC(2026, 8, 9, 0, 0, 0)
+    const after = new Date(Date.UTC(2026, 8, 9, 8, 0, 0))
+    const until = new Date(Date.UTC(2026, 8, 9, 12, 0, 0))
+
+    // An RDATE is an absolute instant rather than a phase of the rule, and rrule-temporal's
+    // previous() walks backwards from a phase-aligned DTSTART: handed a rule carrying one it
+    // answers with the RDATE in place of the occurrence that follows it and loses everything in
+    // between, so a catch-up read built on it dropped jobs for every calendar entry with an RDATE
+    // on it. Both directions read through between() now, so the two agree on every shape.
+    const shapes: Array<[string, string[]]> = [
+      ['no RDATE', []],
+      ['an RDATE between two occurrences', [`RDATE:${ical(Date.UTC(2026, 8, 9, 10, 30, 12))}`]],
+      ['an RDATE on an occurrence', [`RDATE:${ical(Date.UTC(2026, 8, 9, 10, 0, 0))}`]],
+      ['two RDATEs', [`RDATE:${ical(Date.UTC(2026, 8, 9, 10, 30, 12))}`, `RDATE:${ical(Date.UTC(2026, 8, 9, 11, 30, 12))}`]],
+      ['an RDATE before the range', [`RDATE:${ical(Date.UTC(2026, 8, 9, 3, 30, 12))}`]],
+      ['an RDATE after the range', [`RDATE:${ical(Date.UTC(2026, 8, 9, 20, 30, 12))}`]],
+      ['an EXDATE', [`EXDATE:${ical(Date.UTC(2026, 8, 9, 10, 0, 0))}`]],
+      ['an RDATE and an EXDATE', [`RDATE:${ical(Date.UTC(2026, 8, 9, 10, 30, 12))}`, `EXDATE:${ical(Date.UTC(2026, 8, 9, 11, 0, 0))}`]]
+    ]
+
+    for (const [shape, extra] of shapes) {
+      const expression = [`DTSTART:${ical(hour)}`, 'RRULE:FREQ=HOURLY', ...extra].join('\n')
+
+      const forwards = occurrencesInWindow(expression, after, until, 'UTC').map(date => date.toISOString())
+      const backwards = occurrencesBefore(expression, after, until, 'UTC', 100).map(date => date.toISOString()).reverse()
+
+      expect(backwards, shape).toEqual(forwards)
+    }
+  })
+
+  it('reads a range backwards on the bounds the due window leaves off at', function () {
+    const noon = Date.UTC(2026, 8, 9, 12, 0, 0)
+    const expression = `DTSTART:${ical(Date.UTC(2026, 8, 9, 0, 0, 0))}\nRRULE:FREQ=HOURLY`
+
+    const read = (after: number, until: number, limit = 100) =>
+      occurrencesBefore(expression, new Date(after), new Date(until), 'UTC', limit).map(date => date.toISOString())
+
+    // Newest first, the upper bound included and the lower excluded, which is where the due window
+    // starts: an occurrence on the bound belongs to one range or the other, never both.
+    expect(read(noon - 2 * 3_600_000, noon)).toEqual([
+      new Date(noon).toISOString(),
+      new Date(noon - 3_600_000).toISOString()
+    ])
+
+    // The cap keeps the recent end, and reading a range with nothing in it is not an error
+    expect(read(noon - 90 * 24 * 3_600_000, noon, 3)).toEqual([
+      new Date(noon).toISOString(),
+      new Date(noon - 3_600_000).toISOString(),
+      new Date(noon - 2 * 3_600_000).toISOString()
+    ])
+
+    expect(read(noon - 60_000, noon - 30_000)).toEqual([])
+    expect(read(noon, noon)).toEqual([])
+  })
+
   it('fires a rule whose occurrence falls inside the window, measured on the database clock', function () {
     const tk = makeTk()
     tk.clockSkew = 120_000 // db 2 minutes ahead of local
@@ -389,7 +445,7 @@ describe('rrule', function () {
     tk.clockSkew = occurrence + 45_000 - now
     await tk.cron()
 
-    const [first, second] = inserted.filter(job => job.singletonKey === '["rule",""]')
+    const [first, second] = inserted.filter(job => job.singletonKey === 'rule__')
 
     // Both passes name the slot the occurrence falls in, so the second job collapses into the first
     // instead of being sent as a job of its own. A slot rather than an offset from the insert's own
@@ -400,7 +456,7 @@ describe('rrule', function () {
 
     // A cron occurrence keeps the slot every release has always filed it in: during a rolling
     // upgrade an instance on an older release computes that slot and no other.
-    for (const job of inserted.filter(job => job.singletonKey === '["cron",""]')) {
+    for (const job of inserted.filter(job => job.singletonKey === 'cron__')) {
       expect(job.singletonSeconds).toBe(60)
       expect(job.__singletonSlot).toBeUndefined()
     }
@@ -451,7 +507,7 @@ describe('rrule', function () {
     ctx.boss = await helper.start(ctx.bossConfig)
 
     const insert = (__singletonSlot: string) =>
-      ctx.boss!.insert(ctx.schema, [{ singletonKey: '["rule",""]', __singletonSlot }] as any, { returnId: true })
+      ctx.boss!.insert(ctx.schema, [{ singletonKey: 'rule__', __singletonSlot }] as any, { returnId: true, __singletonSlots: true } as any)
 
     // The slot a rule occurrence names, filed twice as two passes on either side of a boundary
     // would file it, then a slot of its own for the occurrence a minute later.
@@ -460,18 +516,22 @@ describe('rrule', function () {
     expect(await insert('2026-09-07 12:01:00')).toHaveLength(1)
   })
 
-  it('leaves an unprefixed singletonSlot on the insert() path where it always was: ignored', async function () {
+  it('leaves a singletonSlot on the insert() path where it always was: ignored', async function () {
     ctx.boss = await helper.start(ctx.bossConfig)
 
-    // The slot is an internal field of the cron pass, not a send option, so a caller naming it
-    // unprefixed neither files the job nor reaches the timestamp cast with an unvalidated value.
-    const [id] = await ctx.boss.insert(ctx.schema, [{ singletonSlot: 'not-a-timestamp' }] as any, { returnId: true }) ?? []
+    // The slot is an internal field of the cron pass, not a send option. insert() spreads caller
+    // objects straight into the recordset, so the column is declared only in the statement the pass
+    // asks for and the field is dropped from the objects insert() is handed: under either spelling
+    // a caller neither files the job nor reaches the timestamp cast with an unvalidated value.
+    for (const field of ['singletonSlot', '__singletonSlot']) {
+      const [id] = await ctx.boss.insert(ctx.schema, [{ [field]: 'not-a-timestamp' }] as any, { returnId: true }) ?? []
 
-    expect(id).toBeTruthy()
+      expect(id).toBeTruthy()
 
-    const [job] = await ctx.boss.findJobs(ctx.schema, { id })
+      const [job] = await ctx.boss.findJobs(ctx.schema, { id })
 
-    expect(job.singletonOn).toBeNull()
+      expect(job.singletonOn).toBeNull()
+    }
   })
 
   it('sends a job for a schedule created from a recurrence rule', async function () {
@@ -541,8 +601,10 @@ describe('rrule', function () {
       // in and the next pass reads it without the fallback
       const relabel = tk.executed.find(({ sql }) => /UPDATE .*schedule .*SET kind/s.test(sql))
 
+      // Carrying the expression the label was read off, so a schedule() upsert landing between this
+      // pass's read and its write is not stamped with the previous expression's kind.
       expect(JSON.parse(relabel!.params[0] as string))
-        .toEqual([{ name: 'mislabelled', key: 'eu', kind: kind === 'cron' ? 'rrule' : 'cron' }])
+        .toEqual([{ name: 'mislabelled', key: 'eu', kind: kind === 'cron' ? 'rrule' : 'cron', cron }])
     }
   })
 

@@ -115,8 +115,12 @@ function firingConfig () {
 async function openGap (gapStart: Date) {
   const db = await helper.getDb()
 
-  await db.executeSql(`UPDATE ${ctx.schema}.schedule SET created_on = $1`, [new Date(gapStart.getTime() - DAY).toISOString()])
-  await db.executeSql(`UPDATE ${ctx.schema}.version SET cron_on = $1`, [gapStart.toISOString()])
+  try {
+    await db.executeSql(`UPDATE ${ctx.schema}.schedule SET created_on = $1`, [new Date(gapStart.getTime() - DAY).toISOString()])
+    await db.executeSql(`UPDATE ${ctx.schema}.version SET cron_on = $1`, [gapStart.toISOString()])
+  } finally {
+    await db.close()
+  }
 }
 
 describe('schedule missed', function () {
@@ -181,6 +185,37 @@ describe('schedule missed', function () {
     // Both formats catch up on the same range: the two boundaries in the gap, then the due one,
     // which a rule files in its own slot rather than the insert's.
     expect(slots(inserted)).toEqual([
+      slotOf(minute - 2 * MINUTE),
+      slotOf(minute - MINUTE),
+      slotOf(minute)
+    ])
+  })
+
+  it('catches up on every occurrence of a rule carrying an RDATE', async function () {
+    const tk = makeTk()
+
+    const minute = Math.floor(Date.now() / MINUTE) * MINUTE
+    const now = minute + 30_000
+
+    // A calendar export pairs a rule with one-off dates, and an RDATE is an absolute instant rather
+    // than a phase of the rule: read backwards through rrule-temporal's previous() the walk jumped
+    // to the RDATE and resumed from there, so every regular occurrence between the cursor and the
+    // RDATE was dropped. Read in chunks of between(), the catch-up sees what the due window sees.
+    const cron = [
+      `DTSTART:${ical(minute - 10 * MINUTE)}`,
+      'RRULE:FREQ=MINUTELY',
+      `RDATE:${ical(minute - 3 * MINUTE + 12_000)}`
+    ].join('\n')
+
+    const inserted = await pass(tk, now, new Date(now - 5 * MINUTE), [
+      row(cron, 'all', { kind: plans.SCHEDULE_KINDS.rrule })
+    ])
+
+    // Every minute the gap held, plus the due one. The RDATE shares the slot of the occurrence it
+    // sits beside, so it collapses into that job rather than adding one.
+    expect(slots(inserted)).toEqual([
+      slotOf(minute - 4 * MINUTE),
+      slotOf(minute - 3 * MINUTE),
       slotOf(minute - 2 * MINUTE),
       slotOf(minute - MINUTE),
       slotOf(minute)
@@ -292,6 +327,20 @@ describe('schedule missed', function () {
       .rejects.toThrow(/missed must be one of: skip, once, all/)
   })
 
+  it('reads a nullish policy as none given, the way a falsy time zone is read', async function () {
+    const tk = makeTk()
+
+    // Same shape as `tz`: a policy threaded out of a config object arrives as null rather than
+    // absent, and a policy name is never falsy, so nothing a caller could have meant is read past.
+    // The pass reads the row as `skip` either way.
+    await expect(tk.schedule('q', DAILY, null, { missed: null } as any)).resolves.toBeUndefined()
+
+    const now = Date.now()
+    const inserted = await pass(tk, now, new Date(now - 10 * MINUTE), [row(DAILY, null as any)])
+
+    expect(slots(inserted)).toEqual([])
+  })
+
   it('stores the policy on the schedule and reads it back', async function () {
     ctx.boss = await helper.start({ ...ctx.bossConfig, schedule: false })
 
@@ -307,26 +356,31 @@ describe('schedule missed', function () {
 
     const db = await helper.getDb()
 
-    // No pass has run against this schema, so there is no gap to report and nothing to catch up on.
-    const first = await db.executeSql(plans.trySetCronTime(ctx.schema, 30))
+    try {
+      // No pass has run against this schema, so there is no gap to report and nothing to catch up
+      // on.
+      const first = await db.executeSql(plans.trySetCronTime(ctx.schema, 30))
 
-    expect(first.rows).toHaveLength(1)
-    expect(first.rows[0].priorCronOn).toBeNull()
+      expect(first.rows).toHaveLength(1)
+      expect(first.rows[0].priorCronOn).toBeNull()
 
-    // A second claim inside the interval takes nothing, which is what keeps two instances from
-    // running the same pass.
-    const contended = await db.executeSql(plans.trySetCronTime(ctx.schema, 30))
+      // A second claim inside the interval takes nothing, which is what keeps two instances from
+      // running the same pass.
+      const contended = await db.executeSql(plans.trySetCronTime(ctx.schema, 30))
 
-    expect(contended.rows).toHaveLength(0)
+      expect(contended.rows).toHaveLength(0)
 
-    const gapStart = new Date(Date.now() - 5 * MINUTE)
+      const gapStart = new Date(Date.now() - 5 * MINUTE)
 
-    await db.executeSql(`UPDATE ${ctx.schema}.version SET cron_on = $1`, [gapStart.toISOString()])
+      await db.executeSql(`UPDATE ${ctx.schema}.version SET cron_on = $1`, [gapStart.toISOString()])
 
-    const claimed = await db.executeSql(plans.trySetCronTime(ctx.schema, 30))
+      const claimed = await db.executeSql(plans.trySetCronTime(ctx.schema, 30))
 
-    expect(claimed.rows).toHaveLength(1)
-    expect(new Date(claimed.rows[0].priorCronOn).getTime()).toBe(gapStart.getTime())
+      expect(claimed.rows).toHaveLength(1)
+      expect(new Date(claimed.rows[0].priorCronOn).getTime()).toBe(gapStart.getTime())
+    } finally {
+      await db.close()
+    }
   })
 
   it('sends the occurrences an outage held', async function () {

@@ -114,6 +114,8 @@ Worth knowing before choosing `all`:
 
 * **One pass sends at most 1000 occurrences per schedule**, keeping the most recent, since a per-minute schedule owes some forty thousand jobs after a month down. When the cap truncates a backlog, the pass emits a [`missed_occurrences_capped`](./events.md#warning) warning naming the schedule.
 
+* **A backlog takes time to become jobs.** The pass creates one internal job per missed occurrence and the worker behind it forwards 50 a poll, so a capped catch-up reaches its queue over something like twenty seconds at the default `cronWorkerIntervalSeconds` of 1. Reading the occurrences costs a few milliseconds, whatever the length of the outage: both formats are read backwards from the due window and stop at the cap.
+
 * **A caught-up job is indistinguishable from an on-time one.** It carries the schedule's `data` unchanged and is created when the pass catches up, so a handler cannot tell it is late, or which occurrence it is running for.
 
 * **The backlog is not ordered.** It reaches the queue oldest first, in one insert, but every job in it is immediately runnable and workers fetch them in no particular order.
@@ -139,7 +141,9 @@ Schedules a job to be sent to the specified queue based on a cron expression or 
 
 * **tz**
 
-  An optional time zone name. If not specified, the default is UTC. An unrecognized time zone is
+  An optional time zone name. If not specified, the default is UTC, and so is a `null` or empty
+  one: those say no zone was chosen, which is what a value threaded out of a config object or read
+  back off a schedule row written before zones were validated looks like. An unrecognized zone is
   rejected by `schedule()`, so a typo cannot be stored and then fail on the cron pass.
 
 * **key**
@@ -149,8 +153,8 @@ Schedules a job to be sent to the specified queue based on a cron expression or 
 * **missed**
 
   What the schedule sends for occurrences that came due while no cron pass ran: `skip` (the
-  default), `once` or `all`. See [Catch-up after an outage](#catch-up-after-an-outage). Any other
-  value is rejected.
+  default), `once` or `all`. See [Catch-up after an outage](#catch-up-after-an-outage). A `null`
+  policy reads as none given, like a `null` zone; any other value is rejected.
 
 
 For example, the following code will send a job at 3:00am in the US central time zone into the queue `notification-abc`.
@@ -201,7 +205,7 @@ Each schedule carries the following properties.
 | `key` | Unique key within the queue, `''` when none was supplied |
 | `kind` | Which format `cron` holds, `cron` or `rrule` |
 | `cron` | Cron expression or recurrence rule |
-| `timezone` | Time zone the expression is evaluated in |
+| `timezone` | Time zone the expression is evaluated in, `UTC` when the row never named one |
 | `data` | Payload sent with each job |
 | `options` | The options `schedule()` was given: the `send()` options each job is created with, and `tz`, `key` and `missed` beside them |
 | `createdOn` | When the schedule was first stored |
@@ -283,7 +287,8 @@ This is pure computation: it does not query the database and does not require a 
 
 * **tz**, string, *default: `UTC`*
 
-  Time zone the expression is evaluated in.
+  Time zone the expression is evaluated in. A `null` or empty zone is read as none given, so
+  previewing a stored schedule from its `timezone` column works whatever release wrote the row.
 
 * **from**, Date, *default: database time*
 

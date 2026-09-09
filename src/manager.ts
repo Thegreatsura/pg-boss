@@ -1128,9 +1128,15 @@ class Manager extends EventEmitter implements types.EventsMixin {
   async insert (
     name: string,
     jobs: types.JobInsert[],
-    options: types.InsertOptions = {}
+    // __singletonSlots is the cron pass's own opt-in, not a documented insert option: it lets a job
+    // name the throttle slot it is filed in, which is how a scheduled occurrence pins its slot to
+    // the occurrence rather than to insert time. Without it the column is neither declared in the
+    // statement nor kept on the objects below, so this stays the raw path it has always been.
+    options: types.InsertOptions & { __singletonSlots?: boolean } = {}
   ) {
     assert(Array.isArray(jobs), 'jobs argument should be an array')
+
+    const slots = options.__singletonSlots === true
 
     const seenIds = new Set<string>()
     for (const job of jobs) {
@@ -1172,8 +1178,15 @@ class Manager extends EventEmitter implements types.EventsMixin {
         blocking,
         pendingDependencies,
         group,
+        __singletonSlot,
         ...rest
-      } = j as types.JobInsert & { blocked?: unknown, blocking?: unknown, pendingDependencies?: unknown }
+      } = j as types.JobInsert & { blocked?: unknown, blocking?: unknown, pendingDependencies?: unknown, __singletonSlot?: string }
+
+      // Reattached only for the caller that asked for the column, so a public insert() drops the
+      // field rather than handing an unvalidated value to a timestamp cast.
+      if (slots && __singletonSlot !== undefined) {
+        Object.assign(rest, { __singletonSlot })
+      }
 
       // Flatten group to the column names insertJobs' json_to_recordset declares, matching
       // send()/upsert()/flow(). Assigned only when a group is present: those same raw column
@@ -1208,7 +1221,7 @@ class Manager extends EventEmitter implements types.EventsMixin {
     // Return IDs if spy is active for this queue (needed for job tracking)
     const returnId = !!spy || !!options.returnId
 
-    const sql = plans.insertJobs(this.config.schema, { table, name, returnId, notify: this.#notifyEnabled(notify) })
+    const sql = plans.insertJobs(this.config.schema, { table, name, returnId, notify: this.#notifyEnabled(notify), slots })
 
     const { rows } = await db.executeSql(sql, [JSON.stringify(insertPayload)])
 
