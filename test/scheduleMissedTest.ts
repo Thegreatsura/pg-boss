@@ -87,7 +87,7 @@ async function waitForJobs (boss: PgBoss, count: number): Promise<Job[]> {
   const deadline = Date.now() + 8_000
 
   while (Date.now() < deadline) {
-    jobs.push(...await boss.fetch(ctx.schema, { batchSize: 100 }))
+    jobs.push(...await boss.fetch<object>(ctx.schema, { batchSize: 100 }))
 
     if (jobs.length >= count) {
       break
