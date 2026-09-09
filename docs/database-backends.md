@@ -63,6 +63,10 @@ leave `useListenNotify` disabled and avoid the queue `notify` option; pg-boss de
 ⁴ PGlite is embedded single-connection PostgreSQL, so LISTEN/NOTIFY works entirely in-process. The
 `fromPglite` adapter wires it up automatically, so `useListenNotify` works with no extra setup.
 
+Bun's `Bun.SQL` client has no row of its own: it is a different *driver* against PostgreSQL, not a
+different database, so it runs on the `postgres` profile with every feature above except
+LISTEN/NOTIFY, which the client does not expose. See [Bun](#bun-driver).
+
 ## Compatibility flags
 
 Here's what each behavior does differently from stock PostgreSQL, and the internal flag it maps to
@@ -360,6 +364,58 @@ concurrency modest:
 PGlite supports in-memory, IndexedDB (browser), and filesystem persistence — see the
 [PGlite docs](https://pglite.dev/docs/filesystems). pg-boss treats all of them identically; the job
 schema and data persist wherever the PGlite instance stores its data directory.
+
+### Bun (driver)
+
+[Bun](https://bun.sh) ships its own PostgreSQL client, `Bun.SQL`. It talks to an ordinary PostgreSQL
+server, so this is not a backend profile — the default `postgres` profile applies and every feature
+works. It is a different *driver*, reached through the `fromBunSql` adapter instead of the `pg`
+connection pool.
+
+You do not need it to run pg-boss on Bun: the bundled `pg` driver works under the Bun runtime, and a
+connection string is the simpler choice. Use the adapter when you want one client, and one pool,
+shared between pg-boss and the rest of your Bun application.
+
+#### Usage
+
+```ts
+import { SQL } from 'bun'
+import PgBoss, { fromBunSql } from 'pg-boss'
+
+const sql = new SQL(process.env.DATABASE_URL)
+
+const boss = new PgBoss({ db: fromBunSql(sql) })
+
+await boss.start()
+
+await boss.createQueue('email')
+await boss.send('email', { to: 'user@example.com' })
+```
+
+As with PGlite, the client is yours: pg-boss never calls `end()` on it.
+
+#### What the adapter absorbs
+
+Two `Bun.SQL` behaviours differ from `pg` in ways pg-boss would otherwise trip over, and the adapter
+handles both — they are listed here because they explain the shape of the queries you will see in
+`pg_stat_statements`, not because you need to do anything about them.
+
+- **Array parameters.** Bun cannot encode a JS array as a PostgreSQL array parameter; it stringifies
+  it, and every `= ANY($n::uuid[])` fails with `malformed array literal`
+  ([oven-sh/bun#18775](https://github.com/oven-sh/bun/issues/18775)). The adapter expands an
+  array-cast parameter into `ARRAY[$2,$3]` of scalar parameters, so bind count varies with the
+  number of ids in a `complete()` or `cancel()` call.
+- **Transaction scripts.** pg-boss installs its schema, migrates, and runs maintenance as
+  `BEGIN; ... COMMIT;` scripts. Bun refuses those on a pooled connection (`Only use sql.begin,
+  sql.reserved or max: 1`), so the adapter reserves a connection for the duration of one.
+
+#### Limitations
+
+- **No `useListenNotify`.** `Bun.SQL` exposes no LISTEN, so pg-boss polls. Everything else —
+  workers, scheduling, maintenance, flows — behaves as it does on `pg`.
+- **Transactional job creation.** The `db` option on `send()`/`insert()` takes anything implementing
+  `executeSql`, so a `sql.begin()` transaction can be wrapped the same way `fromBunSql` wraps the
+  client. For Drizzle users on `bun-sql`, [`fromDrizzle`](api/adapters.md#drizzle) already covers it.
 
 ### Not supported: Aurora DSQL
 

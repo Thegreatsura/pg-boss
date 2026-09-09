@@ -92,6 +92,40 @@ jobs:
     - name: Test (pglite)
       run: npm run test:pglite
 
+  # Runs the fromBunSql conformance suite against a real Postgres under the Bun runtime. Bun's SQL
+  # client only exists inside that runtime, so vitest cannot reach it: test/bunAdapterTest.ts pins
+  # the adapter's rewriting against a fake client on every leg, and this job proves the rewriting is
+  # the right one by driving install, workers, cron and maintenance through the real driver.
+  test-bun:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Bun
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+    - name: Install
+      run: bun install
+
+    - name: Test (bun)
+      run: bun run test:bun
+      env:
+        POSTGRES_HOST: localhost
+
   # docs/index.md is generated from README.md by scripts/sync-readme.js, so a README edit
   # that skips the regenerate step silently leaves the docs home page stale. The check needs
   # no dependencies (the script uses only node builtins) and no database, so it runs as its

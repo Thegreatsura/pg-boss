@@ -55,7 +55,7 @@ await db.transaction(async (tx) => {
 
 `bun-sql` works through the same adapter, which absorbs two Bun-specific encoding limits: it cannot serialize a JS array as a Postgres array parameter ([oven-sh/bun#18775](https://github.com/oven-sh/bun/issues/18775)), and it infers a bind parameter's type from the cast in front of it ([oven-sh/bun#28819](https://github.com/oven-sh/bun/issues/28819)).
 
-Bun's SQL client is not usable as pg-boss's own `db` — it rejects the `BEGIN`/`COMMIT` scripts pg-boss runs for schema installation and maintenance (`Only use sql.begin, sql.reserved or max: 1`). Connect pg-boss with a connection string, which uses the bundled `pg` driver and runs fine under the Bun runtime, and use the adapter for the operations you want inside your own transaction.
+To run pg-boss itself on `Bun.SQL` rather than only enqueue through it, see [`fromBunSql`](../database-backends.md#bun-driver) — the bundled `pg` driver also works under the Bun runtime, so a connection string remains the simplest option.
 
 ## Prisma
 

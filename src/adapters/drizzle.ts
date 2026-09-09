@@ -1,5 +1,5 @@
 import type { IDatabase } from '../types.ts'
-import { parsePlaceholders } from './placeholders.ts'
+import { ARRAY_CAST, parsePlaceholders } from './placeholders.ts'
 import { unwrapSQLResult } from '../tools.ts'
 
 export interface DrizzleTransactionLike {
@@ -40,8 +40,6 @@ export function fromDrizzle (tx: DrizzleTransactionLike, sql: DrizzleSqlTagLike)
   }
 }
 
-const ARRAY_CAST = /^::[a-z_][a-z0-9_]*\[\]/i
-
 // A parameter cast to an array type (`$N::uuid[]`) is expanded into an inline
 // ARRAY[...] constructor of scalar parameters rather than bound whole.
 //
@@ -57,8 +55,7 @@ const ARRAY_CAST = /^::[a-z_][a-z0-9_]*\[\]/i
 // carries no driver-specific knowledge.
 //
 // The array cast is what makes the rewrite safe to apply, so it is required rather
-// than assumed: a JS array bound to a json column is a JSON array, and expanding
-// that one would change what gets stored.
+// than assumed (see ARRAY_CAST).
 function buildQuery (parts: string[], values: unknown[], sql: DrizzleSqlTagLike) {
   const literals: string[] = []
   const params: unknown[] = []
