@@ -15,8 +15,7 @@
     "cron-parser": "^5.10.0",
     "pg": "^8.23.0",
     "rrule-temporal": "~2.2.4",
-    "serialize-error": "^13.0.1",
-    "toad-cache": "^3.7.4"
+    "serialize-error": "^13.0.1"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.8",

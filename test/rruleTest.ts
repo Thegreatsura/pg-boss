@@ -171,21 +171,15 @@ describe('rrule', function () {
       .toBe('2026-07-15T17:00:00.000Z')
   })
 
-  it('answers from a rule it has already built, and keeps answering once the cache is full', function () {
+  it('reads one expression in two zones as two rules, forwards and back', function () {
     const expression = 'FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=9;BYMINUTE=30'
 
-    // One instance serves every `after` it is asked about, forwards or back, and the same
-    // expression on two schedules in two zones is two rules
+    // Every read builds the rule the expression and the zone describe, so the same expression on
+    // two schedules in two zones answers in each of them, and a read is not a cursor: an earlier
+    // `after` after a later one gets the earlier answer.
     expect(next(expression, 'Europe/Berlin')).toBe('2026-09-07T07:30:00.000Z')
     expect(next(expression, 'UTC')).toBe('2026-09-07T09:30:00.000Z')
     expect(next(expression, 'Europe/Berlin', new Date('2026-09-07T08:00:00Z'))).toBe('2026-09-09T07:30:00.000Z')
-    expect(next(expression, 'Europe/Berlin')).toBe('2026-09-07T07:30:00.000Z')
-
-    // Past the cap the cache is dropped wholesale, which costs a rebuild and changes no answer
-    for (let interval = 1; interval <= 1100; interval++) {
-      nextOccurrence(`FREQ=MINUTELY;INTERVAL=${interval}`, AFTER, 'UTC')
-    }
-
     expect(next(expression, 'Europe/Berlin')).toBe('2026-09-07T07:30:00.000Z')
   })
 

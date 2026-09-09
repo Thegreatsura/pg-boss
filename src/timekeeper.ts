@@ -5,7 +5,7 @@ import EventEmitter from 'node:events'
 import * as Attorney from './attorney.ts'
 import type Manager from './manager.ts'
 import * as plans from './plans.ts'
-import { isRrule, latestOccurrenceBefore, nextOccurrence, occurrencesInWindow, assertRrule, assertRruleSends } from './rrule.ts'
+import { isRrule, latestOccurrenceBefore, occurrencesInWindow, rruleWalker, assertRrule, assertRruleSends } from './rrule.ts'
 import { assertTimezone } from './timezone.ts'
 import { delay } from './tools.ts'
 import * as types from './types.ts'
@@ -658,9 +658,9 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     // Keyed on (name, key) so a batch holding more than one occurrence of the same schedule
     // resolves to its latest. Feeding several to the UPDATE would let postgres pick any of the
     // source rows, and last_job_id could end up naming an older job. A batch holds more than one
-    // whenever it spans two minute buckets, and a schedule catching up on a gap can put a job per
-    // missed occurrence in it, which the fetch hands over in no particular order: the slot each
-    // occurrence was filed in is what orders them here.
+    // whenever it spans two minute buckets, and a pass catching a schedule up puts two in at once,
+    // the missed occurrence and the one due now, which the fetch hands over in no particular order:
+    // the slot each occurrence was filed in is what orders them here.
     const fired = new Map<string, { record: FiredSchedule, slot: string }>()
 
     // Surface any failed forward so a lost cron tick isn't silent
@@ -758,17 +758,7 @@ class Timekeeper extends EventEmitter implements types.EventsMixin {
     if (isRrule(expression)) {
       assertRrule(expression, tz)
 
-      let after = from
-
-      return () => {
-        const occurrence = nextOccurrence(expression, after, tz)
-
-        if (occurrence !== null) {
-          after = occurrence
-        }
-
-        return occurrence
-      }
+      return rruleWalker(expression, tz, from)
     }
 
     const interval = parseRecurrence(expression, tz, from)

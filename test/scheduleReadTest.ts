@@ -236,6 +236,23 @@ describe('previewSchedule of a recurrence rule', function () {
     expect(next.toISOString()).toBe('2026-03-03T03:00:00.000Z')
   })
 
+  it('should walk a rule to the count ceiling inside the time budget', function () {
+    const tk = makeTk()
+
+    // The walk builds the rule once and closes over it, the way the cron walk keeps one parsed
+    // interval. Building it per occurrence put the parse inside the loop, so the ceiling spent most
+    // of the budget rebuilding one expression a thousand times, and a sparse rule near the ceiling
+    // loses occurrences to that rather than only milliseconds.
+    const occurrences = tk.previewSchedule('FREQ=MONTHLY;BYDAY=-1FR;BYHOUR=17', {
+      from: new Date('2026-03-01T00:00:00Z'),
+      count: 1000
+    })
+
+    expect(occurrences).toHaveLength(1000)
+    expect(occurrences[0].toISOString()).toBe('2026-03-27T17:00:00.000Z')
+    expect(occurrences[999].getTime()).toBeGreaterThan(occurrences[998].getTime())
+  })
+
   it('should answer a finite rule with what is left of it', function () {
     const tk = makeTk()
 

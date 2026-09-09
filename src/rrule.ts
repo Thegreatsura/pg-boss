@@ -1,6 +1,5 @@
 import assert from 'node:assert'
 import { RRuleTemporal } from 'rrule-temporal'
-import { LruMap } from 'toad-cache'
 
 import { assertTimezone } from './timezone.ts'
 
@@ -68,20 +67,6 @@ const PROPERTY = /^([a-z][a-z0-9-]*)[;:]/i
  * with it.
  */
 const RRULE_SHAPE = /^[ \t]*[a-z][a-z0-9-]*[;:]|(?:^|[\s;])FREQ=/im
-
-/**
- * Rules built on an earlier pass, keyed on the expression and the zone it is evaluated in.
- *
- * An RRuleTemporal is immutable: `between()` answers from the options it was constructed with and
- * caches nothing that depends on its arguments, so an instance is good for as long as the
- * expression is in the schedule table. Building one is roughly a fifth of the cost of evaluating
- * it, and both halves are synchronous, so a deployment with a lot of rule schedules otherwise pays
- * the parse on the event loop on every pass.
- *
- * Least recently used, so the cap costs a deployment that keeps replacing schedules the rules
- * nobody evaluates any more and leaves the ones every pass reads in place.
- */
-const CACHE = new LruMap<RRuleTemporal>(1000)
 
 /** True if `expression` is a recurrence rule rather than a cron expression. */
 export function isRrule (expression: string): boolean {
@@ -271,21 +256,17 @@ function buildRule (ics: string, tz: string): RRuleTemporal {
   return new RRuleTemporal({ rruleString: ics, tzid: tz, strict: true })
 }
 
-/** The rule `expression` evaluates to in `tz`, built once and kept for the passes that follow. */
-function cachedRule (expression: string, tz: string): RRuleTemporal {
-  // Both halves, since one expression on two schedules in two zones is two rules. Separated by a
-  // line break, which a zone name cannot contain.
-  const key = `${tz}\n${expression}`
-
-  let rule = CACHE.get(key)
-
-  if (rule === undefined) {
-    rule = buildRule(toIcs(expression).ics, tz)
-
-    CACHE.set(key, rule)
-  }
-
-  return rule
+/**
+ * The rule `expression` evaluates to in `tz`.
+ *
+ * Built per read rather than kept between them. An RRuleTemporal is immutable, so an instance could
+ * be held for as long as its row is in the schedule table, but building one costs about a tenth of
+ * a millisecond and a pass reads a schedule twice, so keeping the built rules saves a rule schedule
+ * roughly 0.1ms a pass. The one caller that did read the same rule over and over, the preview walk,
+ * builds it once and closes over it instead (see rruleWalker).
+ */
+function parseRule (expression: string, tz: string): RRuleTemporal {
+  return buildRule(toIcs(expression).ics, tz)
 }
 
 /**
@@ -297,9 +278,37 @@ function cachedRule (expression: string, tz: string): RRuleTemporal {
  * same schedule.
  */
 export function nextOccurrence (expression: string, after: Date, tz: string): Date | null {
-  const occurrence = cachedRule(expression, tz).next(after)
+  const occurrence = parseRule(expression, tz).next(after)
 
   return occurrence === null ? null : toDate(occurrence)
+}
+
+/**
+ * A walk of the occurrences after `from`, one call at a time, answering null once a finite rule has
+ * run out and on every call after that.
+ *
+ * The rule is built once and the walk closes over it, which is the difference between a preview and
+ * a pass: a pass reads a schedule twice and a preview asks for up to a thousand occurrences of one
+ * expression, so building per occurrence would spend most of the caller's time budget on the parse.
+ * A sparse rule near the budget then loses occurrences it would otherwise have returned, rather
+ * than only milliseconds.
+ */
+export function rruleWalker (expression: string, tz: string, from: Date): () => Date | null {
+  const rule = parseRule(expression, tz)
+
+  let after = from
+
+  return () => {
+    const occurrence = rule.next(after)
+
+    if (occurrence === null) {
+      return null
+    }
+
+    after = toDate(occurrence)
+
+    return after
+  }
 }
 
 /**
@@ -316,7 +325,7 @@ export function occurrencesInWindow (expression: string, after: Date, until: Dat
   // between() excludes both ends. Excluding the lower one is right: an occurrence exactly on it is
   // one the window before ended on. The upper one is the pass's own reading of the clock, and an
   // occurrence landing on it is due now rather than next time, so the bound is nudged past it.
-  const occurrences = cachedRule(expression, tz).between(after, new Date(until.getTime() + 1))
+  const occurrences = parseRule(expression, tz).between(after, new Date(until.getTime() + 1))
 
   return occurrences.map(toDate)
 }
@@ -358,13 +367,21 @@ const STEP_GROWTH = 4
  * later step goes back over. A step at the floor that still overruns is the expression rather than
  * the width, and the caller hears about it instead.
  *
+ * Narrowing is what the widening costs, and the pass is blocked on it: with the ceiling at the floor
+ * the read walks an hour of range per step, so it costs what it searches rather than what it
+ * returns. Paying that takes an overrun and a long empty stretch behind it, which is a dense rule
+ * that is dense only rarely. `FREQ=SECONDLY;BYMONTHDAY=1` is that shape, and it answers in around
+ * 1.3 seconds, bounded by the distance back to the nearest occurrence rather than by the width of
+ * the gap, so 30 days and 90 cost the same. A rule already spent when the range opens never
+ * overruns, keeps its widening, and answers null in 10ms.
+ *
  * Deliberately not rrule-temporal's previous(). That walks backwards from a phase-aligned DTSTART,
  * and an RDATE is an absolute instant rather than a phase, so a rule carrying one answers with the
  * RDATE in place of the rule occurrence that follows it and loses every occurrence in between.
  * between() has no such problem, and it is what the due window has always read.
  */
 export function latestOccurrenceBefore (expression: string, after: Date, until: Date, tz: string): Date | null {
-  const rule = cachedRule(expression, tz)
+  const rule = parseRule(expression, tz)
   const floor = STEP_SECONDS * 1000
   const start = after.getTime()
 
