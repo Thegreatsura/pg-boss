@@ -314,6 +314,14 @@ export interface CompatibilityFlags {
   /** Omit the `INCLUDE` clause on covering indexes. */
   noCoveringIndexes?: boolean;
   /**
+   * The engine refuses to write a column inside the transaction that added it. CockroachDB runs
+   * `ADD COLUMN` as a schema-change job and answers an `UPDATE` of that column in the same
+   * transaction with "column is being backfilled", so a migration adding a column and seeding it
+   * in one pass cannot run. Migrations drop the seeding statement and leave the column on the
+   * default the `ADD COLUMN` gave it.
+   */
+  noAddColumnBackfill?: boolean;
+  /**
    * Skip LISTEN/NOTIFY entirely, for engines that don't implement it (e.g. CockroachDB).
    * Suppresses both the producer-side transactional `pg_notify` (which would otherwise error
    * on insert) and the `useListenNotify` listener. Polling delivers jobs. (YugabyteDB does

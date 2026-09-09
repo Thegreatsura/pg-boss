@@ -795,6 +795,29 @@ describe('migration', function () {
     expect(uninstall.some(c => /DROP INDEX IF EXISTS .*job_i5/.test(c))).toBe(false)
   })
 
+  it('leaves the v41 kind backfill out where a column cannot be written in the transaction that added it', function () {
+    const kindBackfill = /UPDATE custom\.schedule SET kind/
+
+    const forward = getAll('custom').find(m => m.version === 41)
+    assertTruthy(forward)
+    expect((forward.install as string[]).some(c => kindBackfill.test(c))).toBe(true)
+
+    // CockroachDB runs ADD COLUMN as a schema-change job and refuses an UPDATE of that column in
+    // the same transaction, which the whole migration is: "column is being backfilled". Only the
+    // backfill goes. The label is left to the first pass that reads the row, and the zone
+    // statements stay, since timezone is not a column this migration added.
+    const distributed = getAll('custom', true, true, true).find(m => m.version === 41)
+    assertTruthy(distributed)
+
+    const install = distributed.install as string[]
+
+    expect(install.some(c => kindBackfill.test(c))).toBe(false)
+    expect(install.some(c => /ADD COLUMN IF NOT EXISTS kind/.test(c))).toBe(true)
+    expect(install.some(c => /UPDATE custom\.schedule SET timezone/.test(c))).toBe(true)
+    expect(install.some(c => /ALTER COLUMN timezone SET DEFAULT/.test(c))).toBe(true)
+    expect(install.some(c => /ADD COLUMN IF NOT EXISTS last_job_id/.test(c))).toBe(true)
+  })
+
   itPostgresOnly('labels every schedule stored before v41 from the expression on it', async function () {
     const schema = ctx.bossConfig.schema
     const db = await getDb()

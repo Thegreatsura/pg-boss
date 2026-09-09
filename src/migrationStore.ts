@@ -1099,7 +1099,7 @@ function getMinVersion (schema: string): number {
   return Math.min(...getAll(schema).map(i => i.previous))
 }
 
-function getAll (schema: string, noPartitioning = false, noCovering = false): types.Migration[] {
+function getAll (schema: string, noPartitioning = false, noCovering = false, noAddColumnBackfill = false): types.Migration[] {
   return [
     {
       release: '11.1.0',
@@ -1609,6 +1609,14 @@ function getAll (schema: string, noPartitioning = false, noCovering = false): ty
       // line below the first is matched on the whitespace before it instead. No cron expression
       // matches either, and cannot, since no cron field contains `=`, `:` or `;`.
       //
+      // On a backend that cannot write a column in the transaction that added it (CockroachDB, see
+      // noAddColumnBackfill) the label is left to the pass instead: the whole migration is one
+      // transaction, and the UPDATE fails there with "column is being backfilled". Nothing is lost.
+      // A row whose kind disagrees with its expression is read the way it is written and relabelled
+      // by setScheduleKinds on the first pass that reaches it, which is the same fallback a rolling
+      // upgrade relies on, and that statement CockroachDB accepts. What it costs is the window
+      // before that pass: getSchedules() reports `cron` for a rule row that has not been read yet.
+      //
       // `last_job_id` is the job each schedule most recently produced, so a schedule can be joined
       // to its last run. Nullable and unconstrained on purpose: the referenced job is subject to
       // retention and will eventually be deleted, so a foreign key would either block retention or
@@ -1623,9 +1631,11 @@ function getAll (schema: string, noPartitioning = false, noCovering = false): ty
       // hand-written insert from making another one, and matches what a fresh install now builds.
       install: [
         `ALTER TABLE ${schema}.schedule ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT '${plans.SCHEDULE_KINDS.cron}' CHECK (${plans.SCHEDULE_KIND_CHECK})`,
-        `UPDATE ${schema}.schedule SET kind = '${plans.SCHEDULE_KINDS.rrule}'
-          WHERE kind = '${plans.SCHEDULE_KINDS.cron}'
-            AND (cron ~* '(^|[[:space:]]|;)FREQ=' OR cron ~* '(^|[[:space:]])(DTSTART|RRULE|RDATE|EXDATE)[;:]')`,
+        ...(noAddColumnBackfill
+          ? []
+          : [`UPDATE ${schema}.schedule SET kind = '${plans.SCHEDULE_KINDS.rrule}'
+              WHERE kind = '${plans.SCHEDULE_KINDS.cron}'
+                AND (cron ~* '(^|[[:space:]]|;)FREQ=' OR cron ~* '(^|[[:space:]])(DTSTART|RRULE|RDATE|EXDATE)[;:]')`]),
         `UPDATE ${schema}.schedule SET timezone = 'UTC' WHERE timezone IS NULL`,
         `ALTER TABLE ${schema}.schedule ALTER COLUMN timezone SET DEFAULT 'UTC'`,
         `ALTER TABLE ${schema}.schedule ADD COLUMN IF NOT EXISTS last_job_id uuid`

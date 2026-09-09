@@ -33,7 +33,7 @@ class Contractor {
   constructor (db: types.IDatabase, config: types.ResolvedConstructorOptions) {
     this.config = config
     this.db = db
-    this.migrations = this.config.migrations || migrationStore.getAll(this.config.schema, this.config.noTablePartitioning, this.config.noCoveringIndexes)
+    this.migrations = this.config.migrations || migrationStore.getAll(this.config.schema, this.config.noTablePartitioning, this.config.noCoveringIndexes, this.config.noAddColumnBackfill)
   }
 
   async schemaVersion () {

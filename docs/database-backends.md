@@ -25,7 +25,7 @@ Postgres-compatible engines), or `embedded` (in-process PostgreSQL):
 | `backend` | Kind | What it enables |
 |-----------|------|-----------------|
 | `postgres` *(default)* | standard | *(none — full PostgreSQL)* |
-| `cockroachdb` | distributed | Lock-free fetch, split-statement writes, single shared table, immediate constraints, lock-free schema setup, plain indexes (+ numeric coercion), no LISTEN/NOTIFY |
+| `cockroachdb` | distributed | Lock-free fetch, split-statement writes, single shared table, immediate constraints, lock-free schema setup, plain indexes (+ numeric coercion), default-only column adds, no LISTEN/NOTIFY |
 | `yugabytedb` | distributed | Lock-free schema setup + single shared table |
 | `citus` | distributed | *(none — coordinator-local tables behave like plain PostgreSQL)* |
 | `pglite` | embedded | *(none — full PostgreSQL; see [PGlite](#pglite-embedded))* |
@@ -41,13 +41,13 @@ The matrix shows which PostgreSQL features each backend supports (✅). Where a 
 available (❌), pg-boss automatically switches to the compatible alternative — see the
 [compatibility flags](#compatibility-flags) below.
 
-| Database | Status | `backend` | SKIP LOCKED | Multi-mutation CTEs | Table partitioning | Deferrable constraints | Advisory locks | Covering indexes | LISTEN/NOTIFY |
-|----------|--------|-----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| PostgreSQL | Tested | `postgres` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| CockroachDB | Tested | `cockroachdb` | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| YugabyteDB | Partial¹ | `yugabytedb` | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ✅³ |
-| Citus | Tested² | `citus` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| PGlite | Tested | `pglite` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅⁴ |
+| Database | Status | `backend` | SKIP LOCKED | Multi-mutation CTEs | Table partitioning | Deferrable constraints | Advisory locks | Covering indexes | Writes to a column it just added | LISTEN/NOTIFY |
+|----------|--------|-----------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| PostgreSQL | Tested | `postgres` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| CockroachDB | Tested | `cockroachdb` | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| YugabyteDB | Partial¹ | `yugabytedb` | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ✅ | ✅³ |
+| Citus | Tested² | `citus` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| PGlite | Tested | `pglite` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅⁴ |
 
 ¹ YugabyteDB runs the standard fetch path; non-partitioned queueing works, but partitioned queues,
 multi-master startup, and live migrations fail ([#21833](https://github.com/yugabyte/yugabyte-db/issues/21833)). See below.
@@ -76,9 +76,10 @@ in the source.
 | Immediate constraints | Omit `DEFERRABLE INITIALLY DEFERRED` on foreign keys. | Constraints check immediately rather than at commit (no effect on normal operation). | `noDeferrableConstraints` |
 | Lock-free schema setup | Disable `pg_advisory_xact_lock` (used to coordinate schema creation/migration). | Concurrent instances may occasionally do redundant maintenance — a performance, not correctness, concern. | `noAdvisoryLocks` |
 | Plain indexes | Omit the `INCLUDE` clause on covering indexes. | Slightly less efficient index-only scans during fetch; minimal for most workloads. | `noCoveringIndexes` |
+| Default-only column adds | Leave out the `UPDATE` that seeds a column the same migration added, for engines that refuse to write a column in the transaction that added it. | Rows carry the column's default until something rewrites them: after v41, a schedule holding an RRULE reads as `cron` from `getSchedules()` until the next scheduling pass relabels it. | `noAddColumnBackfill` |
 
-Lock-free fetch and split-statement writes are **runtime** behaviors; the other four are **schema**
-choices applied at install/migration time. CockroachDB needs all six; other distributed engines need
+Lock-free fetch and split-statement writes are **runtime** behaviors; the other five are **schema**
+choices applied at install/migration time. CockroachDB needs all seven; other distributed engines need
 only a subset (see below). One further CockroachDB adjustment — coercing text-encoded integers back
 to numbers — is keyed on `backend === 'cockroachdb'` directly (see below).
 

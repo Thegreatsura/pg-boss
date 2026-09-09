@@ -18,6 +18,7 @@ const COMPATIBILITY_FLAGS = [
   'noDeferrableConstraints',
   'noAdvisoryLocks',
   'noCoveringIndexes',
+  'noAddColumnBackfill',
   'noListenNotify',
   'noIndexProgressView',
   'noReindex',
@@ -48,6 +49,10 @@ const BACKEND_PROFILES: Record<types.BackendProfile, BackendDefinition> = {
       noDeferrableConstraints: true,
       noAdvisoryLocks: true,
       noCoveringIndexes: true,
+      // ADD COLUMN runs as a schema-change job, so a transaction cannot write the column it just
+      // added: the UPDATE fails with "column is being backfilled". A migration that seeds a new
+      // column leaves the seeding statement out here.
+      noAddColumnBackfill: true,
       noListenNotify: true,
       // Online DDL runs as a schema-change job, not the PG CONCURRENTLY path, and
       // pg_stat_progress_create_index isn't available — so BAM can't use liveness-based reclaim.
