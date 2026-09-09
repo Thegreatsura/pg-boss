@@ -101,7 +101,11 @@ jobs:
     services:
       postgres:
         image: postgres
+        # The vitest legs provision the test database themselves in global setup
+        # (testHelper.init -> tryCreateDb); bun test has no such hook, so the service
+        # creates it up front, matching POSTGRES_DB in docker-compose.yaml.
         env:
+          POSTGRES_DB: pgboss
           POSTGRES_PASSWORD: postgres
         ports:
           - 5432:5432
