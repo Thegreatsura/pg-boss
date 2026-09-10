@@ -1099,7 +1099,7 @@ function getMinVersion (schema: string): number {
   return Math.min(...getAll(schema).map(i => i.previous))
 }
 
-function getAll (schema: string, noPartitioning = false, noCovering = false): types.Migration[] {
+function getAll (schema: string, noPartitioning = false, noCovering = false, noAddColumnBackfill = false): types.Migration[] {
   return [
     {
       release: '11.1.0',
@@ -1590,6 +1590,62 @@ function getAll (schema: string, noPartitioning = false, noCovering = false): ty
             ]),
         `ALTER TABLE ${schema}.queue DROP COLUMN monitor_claim_on`,
         `ALTER TABLE ${schema}.version DROP COLUMN monitor_backoff_on`
+      ]
+    },
+    {
+      release: '12.31.0',
+      version: 41,
+      previous: 40,
+      // Two columns on the schedule table, in one migration so a database takes one pass over it.
+      //
+      // `kind` says which format the expression in `cron` is in. The default labels every row cron,
+      // which is what a table this migration has never seen holds: cron was the only format a
+      // schedule could be written in. The UPDATE is for the table it has seen before, since
+      // `uninstall` drops the column rather than remembering it, so a rollback to v40 and a
+      // re-upgrade would otherwise relabel every rule as cron from the default and leave a row that
+      // reads fine and never fires. Reading the expression puts the label back. The two patterns
+      // are the detection isRrule() performs, in the terms both postgres and CockroachDB's regexp
+      // engine share: `^` anchors the whole string in one and not the other, so a property on a
+      // line below the first is matched on the whitespace before it instead. No cron expression
+      // matches either, and cannot, since no cron field contains `=`, `:` or `;`.
+      //
+      // On a backend that cannot write a column in the transaction that added it (CockroachDB, see
+      // noAddColumnBackfill) the label is left to the pass instead: the whole migration is one
+      // transaction, and the UPDATE fails there with "column is being backfilled". Nothing is lost.
+      // A row whose kind disagrees with its expression is read the way it is written and relabelled
+      // by setScheduleKinds on the first pass that reaches it, which is the same fallback a rolling
+      // upgrade relies on, and that statement CockroachDB accepts. What it costs is the window
+      // before that pass: getSchedules() reports `cron` for a rule row that has not been read yet.
+      //
+      // `last_job_id` is the job each schedule most recently produced, so a schedule can be joined
+      // to its last run. Nullable and unconstrained on purpose: the referenced job is subject to
+      // retention and will eventually be deleted, so a foreign key would either block retention or
+      // null the column back out.
+      //
+      // The zone backfill is on the same pass because the same rows are already being read. A null
+      // timezone is how `schedule({ tz: null })` landed on a release whose destructuring default
+      // only covered `undefined`, and how a row written with SQL leaves it out. Nothing ever chose
+      // it: schedule()'s default is UTC and the docs say UTC, but cron-parser reads a non-string
+      // zone as unset, so those rows have been firing in the local zone of whichever instance took
+      // the pass. UTC is what their authors asked for. The default on the column keeps the next
+      // hand-written insert from making another one, and matches what a fresh install now builds.
+      install: [
+        `ALTER TABLE ${schema}.schedule ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT '${plans.SCHEDULE_KINDS.cron}' CHECK (${plans.SCHEDULE_KIND_CHECK})`,
+        ...(noAddColumnBackfill
+          ? []
+          : [`UPDATE ${schema}.schedule SET kind = '${plans.SCHEDULE_KINDS.rrule}'
+              WHERE kind = '${plans.SCHEDULE_KINDS.cron}'
+                AND (cron ~* '(^|[[:space:]]|;)FREQ=' OR cron ~* '(^|[[:space:]])(DTSTART|RRULE|RDATE|EXDATE)[;:]')`]),
+        `UPDATE ${schema}.schedule SET timezone = 'UTC' WHERE timezone IS NULL`,
+        `ALTER TABLE ${schema}.schedule ALTER COLUMN timezone SET DEFAULT 'UTC'`,
+        `ALTER TABLE ${schema}.schedule ADD COLUMN IF NOT EXISTS last_job_id uuid`
+      ],
+      // Dropping `kind` drops its CHECK with it, since the constraint belongs to the column. The
+      // zone default is left in place: a v40 instance names the column on every write, so the
+      // default it would fall back on never applies, and keeping it costs a rollback nothing.
+      uninstall: [
+        `ALTER TABLE ${schema}.schedule DROP COLUMN kind`,
+        `ALTER TABLE ${schema}.schedule DROP COLUMN last_job_id`
       ]
     }
   ]

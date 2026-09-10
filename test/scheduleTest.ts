@@ -449,11 +449,16 @@ describe('schedule', function () {
     await ctx.boss.createQueue(broken)
 
     const db = await helper.getDb()
-    await db.executeSql(
-      `INSERT INTO ${ctx.schema}.schedule (name, key, cron, timezone, data, options)
-       VALUES ($1, '', '* * * * *', 'Mars/Phobos', null, '{}'::jsonb)`,
-      [broken]
-    )
+
+    try {
+      await db.executeSql(
+        `INSERT INTO ${ctx.schema}.schedule (name, key, cron, timezone, data, options)
+         VALUES ($1, '', '* * * * *', 'Mars/Phobos', null, '{}'::jsonb)`,
+        [broken]
+      )
+    } finally {
+      await db.close()
+    }
 
     // Poll rather than sleeping a fixed 4s: the chain is cron pass -> send-it insert -> send-it
     // worker -> fetch, and a fixed sleep is both slower in the common case and short on margin
@@ -477,13 +482,52 @@ describe('schedule', function () {
 
 // Pure unit tests for the clock-domain logic — no database or running instance needed.
 describe('timekeeper clock domain', function () {
-  function makeTk (dbTimeOffsetMs: number, config: object = {}) {
+  // `manager` is only supplied by the tests that drive onSendIt; the clock-domain methods never
+  // touch it. Statements land on `db.executed` so those tests can assert what was written without
+  // changing the return shape the rest of the block relies on.
+  function makeTk (dbTimeOffsetMs: number, config: object = {}, manager: object = {}) {
+    const executed: { sql: string, values?: unknown[] }[] = []
     const db = {
-      executeSql: async () => ({ rows: [{ time: String(Date.now() + dbTimeOffsetMs) }] })
+      executed,
+      executeSql: async (sql: string, values?: unknown[]) => {
+        executed.push({ sql, values })
+        return { rows: [{ time: String(Date.now() + dbTimeOffsetMs) }] }
+      }
     }
-    // manager is unused by the methods under test
-    return new Timekeeper(db as any, {} as any, { schema: 'test', ...config } as any)
+    return new Timekeeper(db as any, manager as any, { schema: 'test', ...config } as any)
   }
+
+  // A manager whose send() walks the given script, one entry per job in the batch. An Error entry
+  // rejects that job's forward, which is what separates a partial batch failure from a total one.
+  function sendingManager (script: (string | null | Error)[]) {
+    let index = 0
+
+    return {
+      send: async () => {
+        const result = script[index++]
+
+        if (result instanceof Error) {
+          throw result
+        }
+
+        return result ?? null
+      }
+    }
+  }
+
+  // The (name, key, jobId) batches handed to the annotating statement, one entry per call.
+  function firedIn (tk: Timekeeper) {
+    const executed = (tk.db as any).executed as { sql: string, values?: unknown[] }[]
+
+    return executed
+      .filter(({ sql }) => sql.includes('last_job_id'))
+      .map(({ values }) => JSON.parse(values![0] as string))
+  }
+
+  // A send-it job as the cron pass writes it. Omitting `key` reproduces a payload queued by a
+  // pre-12.30.0 instance, which carried no way to attribute the job back to a schedule row.
+  const scheduled = (name: string, key?: string) =>
+    ({ data: key === undefined ? { name, data: null, options: {} } : { name, key, data: null, options: {} } })
 
   it('cacheClockSkew keeps the last-known-good skew when the time query fails', async function () {
     const tk = makeTk(30_000) // db ~30s ahead (below the 60s warning threshold)
@@ -534,6 +578,95 @@ describe('timekeeper clock domain', function () {
     expect(errors.some(e => e.message === 'forward failed')).toBe(true)
   })
 
+  it('onSendIt skips a payload queued before the schedule key was carried', async function () {
+    const tk = makeTk(0, {}, sendingManager(['00000000-0000-0000-0000-000000000001']))
+
+    await (tk as any).onSendIt([scheduled('q')])
+
+    expect(firedIn(tk)).toEqual([])
+  })
+
+  it('onSendIt skips an occurrence a queue policy dropped', async function () {
+    const tk = makeTk(0, {}, sendingManager([null]))
+
+    await (tk as any).onSendIt([scheduled('q', '')])
+
+    expect(firedIn(tk)).toEqual([])
+  })
+
+  it('onSendIt records a whole batch of fired schedules in one statement', async function () {
+    const ids = [
+      '00000000-0000-0000-0000-000000000001',
+      '00000000-0000-0000-0000-000000000002',
+      '00000000-0000-0000-0000-000000000003'
+    ]
+    const tk = makeTk(0, {}, sendingManager(ids))
+
+    await (tk as any).onSendIt([scheduled('q', 'a'), scheduled('q', 'b'), scheduled('r', '')])
+
+    expect(firedIn(tk)).toEqual([[
+      { name: 'q', key: 'a', jobId: ids[0] },
+      { name: 'q', key: 'b', jobId: ids[1] },
+      { name: 'r', key: '', jobId: ids[2] }
+    ]])
+  })
+
+  it('onSendIt keeps the results aligned when only part of a batch fails to send', async function () {
+    const id = '00000000-0000-0000-0000-000000000002'
+    const tk = makeTk(0, {}, sendingManager([new Error('forward failed'), id]))
+
+    tk.on('error', () => {})
+
+    // The surviving key must be attributed to its own job. Filtering the settled results before
+    // pairing them with the batch would shift every key after a rejection by one and quietly
+    // stamp the wrong schedule row.
+    await (tk as any).onSendIt([scheduled('q', 'a'), scheduled('q', 'b')])
+
+    expect(firedIn(tk)).toEqual([[{ name: 'q', key: 'b', jobId: id }]])
+  })
+
+  it('onSendIt records the latest occurrence when a batch spans two fires of one schedule', async function () {
+    const ids = [
+      '00000000-0000-0000-0000-000000000001',
+      '00000000-0000-0000-0000-000000000002'
+    ]
+    const tk = makeTk(0, {}, sendingManager(ids))
+
+    // A worker that fell behind can pick up two minute buckets for the same schedule at once.
+    // Handing both to the UPDATE would let postgres choose either source row, so the batch is
+    // deduplicated down to the last occurrence before it reaches SQL.
+    await (tk as any).onSendIt([scheduled('q', 'a'), scheduled('q', 'a')])
+
+    expect(firedIn(tk)).toEqual([[{ name: 'q', key: 'a', jobId: ids[1] }]])
+  })
+
+  it('onSendIt names the schedules when their last job id cannot be recorded', async function () {
+    const tk = makeTk(0, {}, sendingManager(['00000000-0000-0000-0000-000000000001']))
+
+    ;(tk.db as any).executeSql = async () => { throw new Error('boom') }
+
+    const errors: any[] = []
+    tk.on('error', err => errors.push(err))
+
+    await (tk as any).onSendIt([scheduled('q', 'a')])
+
+    expect(errors.length).toBe(1)
+    expect(errors[0].message).toMatch(/"q" \(key "a"\)/)
+    expect(errors[0].message).toMatch(/boom/)
+    expect(errors[0].cause.message).toBe('boom')
+  })
+
+  it('onSendIt survives a failed annotation with no error listener attached', async function () {
+    const tk = makeTk(0, {}, sendingManager(['00000000-0000-0000-0000-000000000001']))
+
+    ;(tk.db as any).executeSql = async () => { throw new Error('boom') }
+
+    // Node throws on an 'error' event with no listener, and index.ts re-promotes this one onto the
+    // PgBoss instance. Letting that escape would fail the send-it job and replay the batch, so the
+    // cron occurrence would be sent a second time over a bookkeeping failure.
+    await expect((tk as any).onSendIt([scheduled('q', 'a')])).resolves.toBeUndefined()
+  })
+
   it('schedule() rejects a time zone postgres-style cron parsing does not validate', async function () {
     const tk = makeTk(0)
 
@@ -565,6 +698,28 @@ describe('timekeeper clock domain', function () {
     await expect(tk.schedule('q', '* * * * *')).resolves.toBeUndefined()
   })
 
+  it('schedule() reads a falsy time zone as none given rather than refusing it', async function () {
+    const tk = makeTk(0)
+    const db = (tk as any).db
+
+    // A destructuring default only covers `undefined`, so a zone threaded out of a config object or
+    // read back off the nullable timezone column arrives here as null. Every one of these was
+    // accepted before zones were validated, and what the author meant by all of them is documented
+    // as UTC, so the row is stored with the zone the docs promise instead of throwing on a value
+    // that used to work.
+    for (const tz of [null, undefined, '', 0]) {
+      await expect(tk.schedule('q', '* * * * *', null, { tz } as any)).resolves.toBeUndefined()
+
+      const { values } = db.executed[db.executed.length - 1]
+
+      expect(values[4]).toBe('UTC')
+    }
+
+    // A zone that says something, and says something unusable, still throws.
+    await expect(tk.schedule('q', '* * * * *', null, { tz: 'Mars/Phobos' })).rejects.toThrow(/time zone/i)
+    await expect(tk.schedule('q', '* * * * *', null, { tz: {} } as any)).rejects.toThrow(/time zone/i)
+  })
+
   it('one unusable schedule row does not stop every other schedule from firing', async function () {
     const tk = makeTk(0)
     ;(tk as any).stopped = false
@@ -577,8 +732,8 @@ describe('timekeeper clock domain', function () {
     // cron() filtered every schedule through one shouldSendIt() call, so this single row silently
     // stopped scheduling for every queue in the whole deployment, on every pass, forever.
     ;(tk as any).getSchedules = async () => ([
-      { name: 'broken', key: '', data: null, options: {}, cron: '* * * * *', timezone: 'Mars/Phobos' },
-      { name: 'healthy', key: '', data: null, options: {}, cron: '* * * * *', timezone: 'UTC' }
+      { name: 'broken', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone: 'Mars/Phobos' },
+      { name: 'healthy', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone: 'UTC' }
     ])
 
     const warnings: any[] = []
@@ -595,12 +750,41 @@ describe('timekeeper clock domain', function () {
     expect(warnings[0].message).toMatch(/broken/)
   })
 
+  it('cron() keeps two schedules apart when their name and key run together', async function () {
+    const tk = makeTk(0)
+    ;(tk as any).stopped = false
+
+    const inserted: any[] = []
+    ;(tk as any).manager = { insert: async (_q: string, jobs: any[]) => { inserted.push(...jobs) } }
+
+    // Underscores are legal in both a queue name and a schedule key, so the raw `${name}__${key}`
+    // handed these two rows the same singleton key and the 60s window dropped whichever lost the
+    // race: one schedule never fired, and so never recorded a last job id either.
+    ;(tk as any).getSchedules = async () => ([
+      { name: 'report_', key: 'daily', data: null, options: {}, cron: '* * * * *', timezone: 'UTC' },
+      { name: 'report', key: '_daily', data: null, options: {}, cron: '* * * * *', timezone: 'UTC' },
+      { name: 'report', key: 'daily', data: null, options: {}, cron: '* * * * *', timezone: 'UTC' }
+    ])
+
+    await tk.cron()
+
+    const keys = inserted.map(({ singletonKey }) => singletonKey)
+
+    expect(keys.length).toBe(3)
+    expect(new Set(keys).size).toBe(3)
+
+    // And the key is what every release has written for a name carrying no underscore, which is
+    // what keeps a rolling upgrade from filing one occurrence twice: only the pairs that already
+    // collide today move.
+    expect(keys).toContain('report__daily')
+  })
+
   it('an unusable schedule row warns once, not on every pass', async function () {
     const tk = makeTk(0)
     ;(tk as any).stopped = false
     ;(tk as any).manager = { insert: async () => {} }
     ;(tk as any).getSchedules = async () => ([
-      { name: 'broken', key: '', data: null, options: {}, cron: '* * * * *', timezone: 'Mars/Phobos' }
+      { name: 'broken', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone: 'Mars/Phobos' }
     ])
 
     const warnings: any[] = []
@@ -624,7 +808,7 @@ describe('timekeeper clock domain', function () {
 
     let timezone = 'Mars/Phobos'
     ;(tk as any).getSchedules = async () => ([
-      { name: 'broken', key: '', data: null, options: {}, cron: '* * * * *', timezone }
+      { name: 'broken', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone }
     ])
 
     const warnings: any[] = []
@@ -652,7 +836,7 @@ describe('timekeeper clock domain', function () {
 
     let timezone = 'Mars/Phobos'
     ;(tk as any).getSchedules = async () => ([
-      { name: 'broken', key: '', data: null, options: {}, cron: '* * * * *', timezone }
+      { name: 'broken', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone }
     ])
 
     const warnings: any[] = []
@@ -674,7 +858,7 @@ describe('timekeeper clock domain', function () {
     ;(tk as any).stopped = false
     ;(tk as any).manager = { insert: async () => {} }
     ;(tk as any).getSchedules = async () => ([
-      { name: 'broken', key: '', data: null, options: {}, cron: '* * * * *', timezone: 'Mars/Phobos' }
+      { name: 'broken', key: '', data: null, options: {}, kind: 'cron', cron: '* * * * *', timezone: 'Mars/Phobos' }
     ])
 
     const warnings: any[] = []

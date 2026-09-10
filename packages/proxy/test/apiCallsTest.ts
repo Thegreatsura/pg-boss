@@ -502,8 +502,8 @@ describe('proxy api routes', () => {
       },
       {
         method: 'schedule',
-        body: { name: 'queue', cron: '* * * * *', data: { a: 1 }, options: { tz: 'UTC' } },
-        expected: ['queue', '* * * * *', { a: 1 }, { tz: 'UTC' }]
+        body: { name: 'queue', cron: '* * * * *', data: { a: 1 }, options: { tz: 'UTC', missed: 'once' } },
+        expected: ['queue', '* * * * *', { a: 1 }, { tz: 'UTC', missed: 'once' }]
       },
       {
         method: 'unschedule',
@@ -545,6 +545,14 @@ describe('proxy api routes', () => {
       { method: 'getSchedules', query: 'name=queue&key=k', expected: ['queue', 'k'] },
       { method: 'getSchedules', query: 'name=queue', expected: ['queue'] },
       { method: 'getSchedules', expected: [] },
+      { method: 'getSchedule', query: 'name=queue&key=k', expected: ['queue', 'k'] },
+      { method: 'getSchedule', query: 'name=queue', expected: ['queue'] },
+      { method: 'previewSchedule', query: 'cron=0+3+*+*+*', expected: ['0 3 * * *'] },
+      {
+        method: 'previewSchedule',
+        query: 'cron=0+3+*+*+*&tz=America%2FChicago&count=3&from=2026-03-01T00%3A00%3A00Z',
+        expected: ['0 3 * * *', { tz: 'America/Chicago', from: new Date('2026-03-01T00:00:00Z'), count: 3 }]
+      },
     ]
 
     for (const entry of getCases) {
@@ -642,6 +650,17 @@ describe('proxy api routes', () => {
     const { app } = await createProxyService({ options: {}, bossFactory: () => boss as any })
 
     const req = new Request('http://local/api/getQueueStats?name=queue&limit=-5', { method: 'GET' })
+    const res = await app.fetch(req)
+    expect(res.status).toBe(400)
+  })
+
+  it('GET previewSchedule rejects a count past the method ceiling', async () => {
+    const { boss } = createBossMock()
+    const { app } = await createProxyService({ options: {}, bossFactory: () => boss as any })
+
+    // The method asserts the same ceiling, so without it here the refusal arrives as a 500 built
+    // out of assertion text rather than a 400 naming the parameter.
+    const req = new Request('http://local/api/previewSchedule?cron=0+3+*+*+*&count=1001', { method: 'GET' })
     const res = await app.fetch(req)
     expect(res.status).toBe(400)
   })

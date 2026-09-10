@@ -314,6 +314,14 @@ export interface CompatibilityFlags {
   /** Omit the `INCLUDE` clause on covering indexes. */
   noCoveringIndexes?: boolean;
   /**
+   * The engine refuses to write a column inside the transaction that added it. CockroachDB runs
+   * `ADD COLUMN` as a schema-change job and answers an `UPDATE` of that column in the same
+   * transaction with "column is being backfilled", so a migration adding a column and seeding it
+   * in one pass cannot run. Migrations drop the seeding statement and leave the column on the
+   * default the `ADD COLUMN` gave it.
+   */
+  noAddColumnBackfill?: boolean;
+  /**
    * Skip LISTEN/NOTIFY entirely, for engines that don't implement it (e.g. CockroachDB).
    * Suppresses both the producer-side transactional `pg_notify` (which would otherwise error
    * on insert) and the `useListenNotify` listener. Polling delivers jobs. (YugabyteDB does
@@ -730,7 +738,46 @@ export interface QueueResult extends Queue {
   singletonsActive: string[] | null;
 }
 
-export type ScheduleOptions = SendOptions & { tz?: string, key?: string }
+export type ScheduleOptions = SendOptions & {
+  tz?: string,
+  key?: string,
+  /**
+   * What to do about occurrences that came due while no cron pass ran, which is what a deployment
+   * being down, or between deploys, leaves behind.
+   *
+   * `skip` sends nothing for them. `once` sends a single job for the most recent one, however many
+   * were missed.
+   * @default 'skip'
+   */
+  missed?: ScheduleMissedPolicy
+}
+
+export interface PreviewScheduleOptions {
+  /**
+   * Time zone the expression is evaluated in.
+   * @default 'UTC'
+   */
+  tz?: string;
+  /**
+   * Reference point the walk starts from. Occurrences are strictly after it, so passing the last
+   * occurrence of one page back in yields the next page.
+   *
+   * The default is database time, the instance clock plus the skew cached against the database.
+   * Skew is only cached by an instance started with scheduling enabled; on any other instance it is
+   * zero and the default reduces to this process's local clock.
+   * @default database time (the instance clock plus the cached skew)
+   */
+  from?: Date;
+  /**
+   * How many occurrences to return. Must be an integer between 1 and 1000. A finite rule answers
+   * with fewer, and one whose last occurrence has passed answers with none.
+   *
+   * A walk that has not produced them within a second gives up, since occurrences of a sparse
+   * expression are expensive to find and the walk holds the event loop while it runs.
+   * @default 5
+   */
+  count?: number;
+}
 
 /**
  * How long a worker waits between fetches. The delay before each fetch is chosen by
@@ -929,13 +976,40 @@ export interface Request {
   options?: SendOptions;
 }
 
+/** Which format a schedule's expression is in. */
+export type ScheduleKind = 'cron' | 'rrule'
+
+/** What a schedule does about occurrences that came due while no cron pass ran. */
+export type ScheduleMissedPolicy = 'skip' | 'once'
+
 export interface Schedule {
   name: string;
   key: string;
+  /** Which of the two formats `cron` holds, decided by `schedule()` and stored on the row. */
+  kind: ScheduleKind;
+  /** The cron expression or recurrence rule this schedule recurs on. */
   cron: string;
   timezone: string;
   data?: object;
-  options?: SendOptions;
+  /**
+   * The options blob `schedule()` stored, which is every option it was given: the `send()` options
+   * each job is created with, and `tz`, `key` and `missed` beside them.
+   */
+  options?: ScheduleOptions;
+  createdOn: Date;
+  updatedOn: Date;
+  /**
+   * Id of the job this schedule most recently created.
+   *
+   * Recorded on a best-effort basis, in a separate statement once the job exists, so `null` does
+   * not mean the schedule never fired. It also reads `null` for a schedule that last fired before
+   * the upgrade that added the column, and for one whose annotating statement lost its connection
+   * between creating the job and recording it.
+   *
+   * Not a foreign key: the job is subject to the queue's retention policy and will eventually be
+   * deleted, so an id here does not guarantee the job still exists.
+   */
+  lastJobId: string | null;
 }
 
 export interface Job<T = object> {

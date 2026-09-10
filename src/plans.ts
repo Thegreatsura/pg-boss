@@ -63,6 +63,45 @@ export const QUEUE_POLICIES = Object.freeze({
   key_strict_fifo: 'key_strict_fifo'
 })
 
+/**
+ * How the expression in a schedule row is read: a cron expression, or an RFC 5545 recurrence rule.
+ *
+ * Stored on the row rather than derived from the expression on every pass, so the format is decided
+ * once, by whoever writes the schedule, and every reader agrees with that decision. A row written
+ * straight into the table with SQL has to name its own kind; the column defaults to cron, which is
+ * what every schedule written before rules existed is.
+ */
+export const SCHEDULE_KINDS = Object.freeze({
+  cron: 'cron',
+  rrule: 'rrule'
+} as const)
+
+/** The kind column's domain, for the CHECK on the table and the migration that adds it. */
+export const SCHEDULE_KIND_CHECK = `kind IN ('${SCHEDULE_KINDS.cron}', '${SCHEDULE_KINDS.rrule}')`
+
+/**
+ * What a schedule does about occurrences that came due while no cron pass ran.
+ *
+ * A pass sends what the last minute holds, so nothing outside that window is sent at all: a
+ * deployment that was down, or between deploys, for an hour never sends the occurrences that hour
+ * held. `skip` is that behavior, and stays the default, since a job appearing on the first pass
+ * after a deploy for work whose moment has passed is a surprise nobody asked for.
+ *
+ * `once` sends a single job however many occurrences were missed, which is what a schedule whose
+ * job reads the current state of the world wants: a nightly report that missed three nights is one
+ * report, not three. One job needs no occurrence identity to be worth running, which is what a
+ * policy sending a job per missed occurrence would need and has no way to carry: the forwarded job
+ * gets the schedule's `data` and nothing else, so a handler could not tell which hour of an outage
+ * each of twelve identical jobs was for.
+ *
+ * Part of the options blob rather than a column of its own: the pass reads every schedule row
+ * anyway, and nothing queries the table by policy.
+ */
+export const SCHEDULE_MISSED_POLICIES = Object.freeze({
+  skip: 'skip',
+  once: 'once'
+} as const)
+
 const QUEUE_DEFAULTS = {
   expire_seconds: FIFTEEN_MINUTES,
   retention_seconds: FORTEEN_DAYS,
@@ -219,17 +258,26 @@ function createTableQueue (schema: string) {
   `
 }
 
+// `cron` holds the expression whatever its format, and `kind` says which format that is: the column
+// predates rules and renaming it would break every consumer reading the table, from the dashboard to
+// a hand-written query.
+//
+// `timezone` defaults to UTC rather than to null, so a row written straight into the table with SQL
+// gets the zone schedule() would have given it. Nullable still, because an instance on an older
+// release can write a null during a rolling upgrade, which is what the read-side COALESCE covers.
 function createTableSchedule (schema: string) {
   return `
     CREATE TABLE ${schema}.schedule (
       name text REFERENCES ${schema}.queue ON DELETE CASCADE,
       key text not null DEFAULT '',
+      kind text not null DEFAULT '${SCHEDULE_KINDS.cron}' CHECK (${SCHEDULE_KIND_CHECK}),
       cron text not null,
-      timezone text,
+      timezone text DEFAULT 'UTC',
       data jsonb,
       options jsonb,
       created_on timestamp with time zone not null default now(),
       updated_on timestamp with time zone not null default now(),
+      last_job_id uuid,
       PRIMARY KEY (name, key)
     )
   `
@@ -938,8 +986,24 @@ export function trySetQueueDeletionTime (schema: string, queues: string[], secon
   return trySetQueueTimestamp(schema, queues, 'maintain_on', seconds)
 }
 
+// The cron claim, which also answers with the timestamp it replaced. That timestamp is when an
+// instance last ran a pass, so the pass reads it to find out how long scheduling was off, which is
+// the window a schedule's `missed` policy catches up over. Null on a database no pass has ever run
+// against, where there is no gap to catch up on.
+//
+// The prior value has to come from a CTE of its own: RETURNING sees the row as the UPDATE leaves
+// it, while a WITH sub-statement reads the snapshot the whole statement was planned against, so it
+// sees the value the UPDATE is replacing. Zero rows still means another instance holds the claim,
+// which is all the caller checked before.
 export function trySetCronTime (schema: string, seconds: number) {
-  return trySetTimestamp(schema, 'cron_on', seconds)
+  return `
+    WITH prior AS (
+      SELECT cron_on FROM ${schema}.version
+    ), claim AS (
+      ${trySetTimestamp(schema, 'cron_on', seconds)}
+    )
+    SELECT prior.cron_on as "priorCronOn" FROM prior, claim
+  `
 }
 
 export function trySetBamTime (schema: string, seconds: number) {
@@ -1067,23 +1131,87 @@ export function deleteAllJobs (schema: string, table: string) {
   return `DELETE from ${schema}.${table} WHERE name = $1`
 }
 
+// Named and aliased rather than SELECT *, so the timestamp columns and last_job_id reach callers
+// in the same camelCase shape every other read in the API uses.
+//
+// The zone is coalesced because the column is nullable and Schedule.timezone is not: schedule()
+// stores 'UTC' for a zone it was not given, and the v41 migration retires the nulls already in the
+// table, but an instance on an older release can still write one during a rolling upgrade, and a
+// row written with SQL can leave it out. Null read back as null would evaluate in the host's local
+// zone, which no caller ever asked for and which differs between instances.
+const SCHEDULE_COLUMNS = `
+  name,
+  key,
+  kind,
+  cron,
+  COALESCE(timezone, 'UTC') as timezone,
+  data,
+  options,
+  created_on as "createdOn",
+  updated_on as "updatedOn",
+  last_job_id as "lastJobId"
+`
+
 export function getSchedules (schema: string) {
-  return `SELECT * FROM ${schema}.schedule ORDER BY name, key`
+  return `SELECT ${SCHEDULE_COLUMNS} FROM ${schema}.schedule ORDER BY name, key`
 }
 
 export function getSchedulesByQueue (schema: string) {
-  return `SELECT * FROM ${schema}.schedule WHERE name = $1 ORDER BY key`
+  return `SELECT ${SCHEDULE_COLUMNS} FROM ${schema}.schedule WHERE name = $1 ORDER BY key`
 }
 
 export function getSchedulesByQueueAndKey (schema: string) {
-  return `SELECT * FROM ${schema}.schedule WHERE name = $1 AND COALESCE(key, '') = $2`
+  return `SELECT ${SCHEDULE_COLUMNS} FROM ${schema}.schedule WHERE name = $1 AND COALESCE(key, '') = $2`
+}
+
+// Records the job each schedule most recently produced. Written from the send-it handler after the
+// job exists, one statement per batch rather than one per schedule, with the (name, key, job id)
+// triples carried in a JSON recordset.
+//
+// The caller must supply at most one record per (name, key): postgres leaves it unspecified which
+// source row an UPDATE ... FROM uses when several join the same target, so duplicates would make
+// the resulting last_job_id arbitrary rather than latest.
+//
+// updated_on is deliberately left alone: it tracks edits to the definition, and a firing schedule
+// has not been edited.
+export function setScheduleLastJobIds (schema: string) {
+  return `
+    UPDATE ${schema}.schedule s
+    SET last_job_id = x."jobId"
+    FROM json_to_recordset($1::json) AS x (name text, key text, "jobId" uuid)
+    WHERE s.name = x.name
+      AND COALESCE(s.key, '') = x.key
+  `
+}
+
+/**
+ * Relabels the kind of one or more schedules, as the cron pass does when a row's stored kind
+ * disagrees with the expression beside it.
+ *
+ * `updated_on` is deliberately untouched: it tracks edits to the definition, and a relabel is the
+ * pass agreeing with what the row already said, not a change to what the schedule does.
+ *
+ * Matched on the expression as well as the primary key, so a schedule() upsert landing between the
+ * pass's read and this write keeps the kind it was stored with instead of being stamped with the
+ * previous expression's. A row that misses the update because it changed underneath is relabelled
+ * by the next pass if it still needs it.
+ */
+export function setScheduleKinds (schema: string) {
+  return `
+    UPDATE ${schema}.schedule s SET kind = k.kind
+    FROM json_to_recordset($1::json) as k (name text, key text, kind text, cron text)
+    WHERE s.name = k.name
+      AND COALESCE(s.key, '') = k.key
+      AND s.cron = k.cron
+  `
 }
 
 export function schedule (schema: string) {
   return `
-    INSERT INTO ${schema}.schedule (name, key, cron, timezone, data, options)
-    VALUES ($1, $2, $3, $4, $5, $6)
+    INSERT INTO ${schema}.schedule (name, key, kind, cron, timezone, data, options)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
     ON CONFLICT (name, key) DO UPDATE SET
+      kind = EXCLUDED.kind,
       cron = EXCLUDED.cron,
       timezone = EXCLUDED.timezone,
       data = EXCLUDED.data,
@@ -1914,9 +2042,13 @@ interface InsertJobsOptions {
   name: string
   returnId?: boolean
   notify?: boolean
+  // Whether a job may name the throttle slot it is filed in. Only the cron pass asks for it, so the
+  // statement a public insert() builds does not declare the column and a caller naming it sets
+  // nothing. See the CASE below.
+  slots?: boolean
 }
 
-export function insertJobs (schema: string, { table, name, returnId = true, notify = false }: InsertJobsOptions) {
+export function insertJobs (schema: string, { table, name, returnId = true, notify = false, slots = false }: InsertJobsOptions) {
   // When notify is enabled we always RETURN start_after so the wrapper below can gate
   // the NOTIFY on immediate availability, regardless of whether the caller wants ids.
   const returning = notify ? 'RETURNING id, start_after' : returnId ? 'RETURNING id' : ''
@@ -1954,6 +2086,15 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
       j.start_after,
       "singletonKey",
       CASE
+        -- A caller that knows the slot names it outright: the cron pass files a rule occurrence in
+        -- the slot the occurrence falls in, and an offset off now() cannot pin that, since now()
+        -- here is insert time. Only in the statement the pass asks for, because insert()
+        -- stringifies caller objects straight into the recordset below, so a column declared for
+        -- everyone would be a live, undeclared and unvalidated option on the public path, where a
+        -- bad value surfaces as a raw postgres error. Prefixed as well, and not called singletonOn,
+        -- which is a column fetching a job hands back, so a job read from one queue and inserted
+        -- into another cannot fill it in by accident.
+        ${slots ? 'WHEN "__singletonSlot" IS NOT NULL THEN CAST("__singletonSlot" as timestamp)' : ''}
         WHEN "singletonSeconds" IS NOT NULL THEN 'epoch'::timestamp + '1s'::interval * ("singletonSeconds"::float8 * floor(( date_part('epoch', now()) + COALESCE("singletonOffset",0)::float8) / "singletonSeconds"::float8 ))
         ELSE NULL
         END as singleton_on,
@@ -1990,6 +2131,7 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
         "singletonKey" text,
         "singletonSeconds" integer,
         "singletonOffset" integer,
+        ${slots ? '"__singletonSlot" text,' : ''}
         "groupId" text,
         "groupTier" text,
         "expireInSeconds" integer,

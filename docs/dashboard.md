@@ -36,7 +36,7 @@ Every queue in the schema with its policy and cached counts (queued, deferred, r
 
 ### Schedules
 
-Cron-based schedules registered with `boss.schedule()`, showing the target queue, optional key, cron expression, a human-readable frequency, the next occurrence and timezone. **Schedule Job** creates a new schedule, and each schedule's detail page shows its data and options and lets you unschedule it.
+Schedules registered with `boss.schedule()`, showing the target queue, optional key, expression, a human-readable frequency, the next occurrence and timezone. The frequency and next occurrence are read from the expression as cron, so a schedule stored as an [RRULE](./api/scheduling.md#rrule-expressions) is listed with neither. **Schedule Job** creates a new schedule, and each schedule's detail page shows its data and options and lets you unschedule it.
 
 ![Schedules page](./images/dashboard-schedules.png)
 

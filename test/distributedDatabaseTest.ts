@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest'
 import * as helper from './testHelper.ts'
 import { ctx } from './hooks.ts'
+import { isDistributedBackend, distributedTimeout } from './timeouts.ts'
 
 // This file holds ONLY the invariants the general suite structurally cannot express. General
 // behavioral coverage (fetch/complete/fail/retry/policies/flows/dead-letter/...) already runs in
@@ -17,17 +18,15 @@ import { ctx } from './hooks.ts'
 //      noCoveringIndexes / noAdvisoryLocks) — the ONLY Postgres-side coverage of that DDL, since the
 //      `DISTRIBUTED=true` job sets noSkipLocked + noMultiMutationCte but NOT the schema no* flags.
 //
-// Every test here calls helper.start(), which on CockroachDB pays slow per-test DDL (~8-9s observed
-// in CI), leaving little headroom under the 10s global timeout. Raise the default for the whole
-// block so startup jitter can't push a test over the edge (the concurrency tests keep their explicit
-// per-test overrides).
+// Every test here calls helper.start(), which on CockroachDB pays slow per-test DDL, leaving little
+// headroom under the 10s Postgres global. Raise the default for the whole block so startup jitter
+// can't push a test over the edge (the concurrency tests keep their explicit per-test overrides).
 //
-// The override must only LIFT the Postgres budget — never cap a distributed backend. vitest.config.ts
-// already gives cockroachdb/yugabytedb a 60s global; a flat 20s here would lower it for exactly the
-// heaviest tests (the withTransaction composition tests do slow DDL + an extra connection), which is
-// how they timed out at 20s on the CockroachDB run. So match that 60s on distributed backends.
-const isDistributedBackend = process.env.DB_TYPE === 'cockroachdb' || process.env.DB_TYPE === 'yugabytedb'
-const blockTimeout = isDistributedBackend ? 60000 : 20000
+// The override must only LIFT the Postgres budget, never cap a distributed backend: a per-test or
+// per-block value replaces the global in both directions, so a flat 20s here would lower it for
+// exactly the heaviest tests (the withTransaction composition tests do slow DDL plus an extra
+// connection). A distributed backend keeps the budget test/timeouts.ts sets for it.
+const blockTimeout = isDistributedBackend ? distributedTimeout : 20000
 
 // The concurrency tests need more than the block default on Postgres, so they carry their own
 // override - which has to follow the same rule, since a per-test value replaces the block value in

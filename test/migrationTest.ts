@@ -795,6 +795,91 @@ describe('migration', function () {
     expect(uninstall.some(c => /DROP INDEX IF EXISTS .*job_i5/.test(c))).toBe(false)
   })
 
+  it('leaves the v41 kind backfill out where a column cannot be written in the transaction that added it', function () {
+    const kindBackfill = /UPDATE custom\.schedule SET kind/
+
+    const forward = getAll('custom').find(m => m.version === 41)
+    assertTruthy(forward)
+    expect((forward.install as string[]).some(c => kindBackfill.test(c))).toBe(true)
+
+    // CockroachDB runs ADD COLUMN as a schema-change job and refuses an UPDATE of that column in
+    // the same transaction, which the whole migration is: "column is being backfilled". Only the
+    // backfill goes. The label is left to the first pass that reads the row, and the zone
+    // statements stay, since timezone is not a column this migration added.
+    const distributed = getAll('custom', true, true, true).find(m => m.version === 41)
+    assertTruthy(distributed)
+
+    const install = distributed.install as string[]
+
+    expect(install.some(c => kindBackfill.test(c))).toBe(false)
+    expect(install.some(c => /ADD COLUMN IF NOT EXISTS kind/.test(c))).toBe(true)
+    expect(install.some(c => /UPDATE custom\.schedule SET timezone/.test(c))).toBe(true)
+    expect(install.some(c => /ALTER COLUMN timezone SET DEFAULT/.test(c))).toBe(true)
+    expect(install.some(c => /ADD COLUMN IF NOT EXISTS last_job_id/.test(c))).toBe(true)
+  })
+
+  itPostgresOnly('labels every schedule stored before v41 from the expression on it', async function () {
+    const schema = ctx.bossConfig.schema
+    const db = await getDb()
+
+    try {
+      await contractor.create()
+      await db.executeSql(`SELECT ${schema}.create_queue('sched_q', '{"policy":"standard"}'::jsonb)`)
+
+      await rollbackTo(40)
+
+      const store = (key: string, cron: string) => db.executeSql(
+        `INSERT INTO ${schema}.schedule (name, key, cron, timezone) VALUES ('sched_q', $1, $2, 'UTC')`,
+        [key, cron])
+
+      // A row written while cron was the only format a schedule could hold, which is every row a
+      // database upgrading to v41 for the first time holds.
+      await store('nightly', '0 3 * * *')
+
+      // And the rows a rollback to v40 leaves behind, which dropping the column took the format of.
+      // The default alone would label these cron, and the pass would then read a rule as a cron
+      // expression and warn about it every 30 seconds instead of firing it. Both the bare rule and
+      // the property at the head of a line are matched, the second on a line below the first.
+      await store('rule', 'FREQ=DAILY;BYHOUR=3')
+      await store('block', 'DTSTART:20260901T090000Z\nRRULE:FREQ=WEEKLY;BYDAY=MO')
+
+      // And a row whose zone was never stored, which is what `schedule({ tz: null })` wrote before
+      // a falsy zone read as "none given".
+      await db.executeSql(
+        `INSERT INTO ${schema}.schedule (name, key, cron, timezone) VALUES ('sched_q', 'zoneless', '0 3 * * *', NULL)`)
+
+      await contractor.migrate(40)
+      expect(await contractor.schemaVersion()).toBe(currentSchemaVersion)
+
+      const { rows } = await db.executeSql(`SELECT key, kind FROM ${schema}.schedule ORDER BY key`)
+      expect(rows).toEqual([
+        { key: 'block', kind: 'rrule' },
+        { key: 'nightly', kind: 'cron' },
+        { key: 'rule', kind: 'rrule' },
+        { key: 'zoneless', kind: 'cron' }
+      ])
+
+      // The zone a row never carried. Nothing chose it: schedule()'s default is UTC and the docs
+      // say UTC, but a destructuring default only covers `undefined`, so `schedule({ tz: null })`
+      // left the column null and cron-parser then evaluated the row in the local zone of whichever
+      // instance took the pass. The backfill is what makes Schedule.timezone the string its type
+      // says it is.
+      const { rows: zones } = await db.executeSql(`SELECT count(*)::int as nulls FROM ${schema}.schedule WHERE timezone IS NULL`)
+      expect(zones[0].nulls).toBe(0)
+
+      const { rows: backfilled } = await db.executeSql(`SELECT timezone FROM ${schema}.schedule WHERE key = 'zoneless'`)
+      expect(backfilled[0].timezone).toBe('UTC')
+
+      // And the kind a row cannot be: the column carries the two formats pg-boss evaluates, so a
+      // value nothing reads is refused rather than stored and silently treated as cron.
+      await expect(db.executeSql(
+        `INSERT INTO ${schema}.schedule (name, key, kind, cron, timezone) VALUES ('sched_q', 'x', 'crontab', '0 3 * * *', 'UTC')`
+      )).rejects.toThrow(/schedule_kind_check/)
+    } finally {
+      await db.close()
+    }
+  })
+
   it('patch upgrade from schema 35 carries only the bam default — no job-index churn (issue #832)', function () {
     // A database already past v33 (schema 35) upgrading to 36 runs only v36, which carries the
     // bam.created_on default change and NO index work. So it never re-drops/rebuilds its existing

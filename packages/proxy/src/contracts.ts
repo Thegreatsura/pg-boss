@@ -85,9 +85,13 @@ export const updateOptionsSchema = z.object({
   match: z.enum(['newest', 'oldest', 'all']).optional(),
 }) satisfies z.ZodType<types.HttpUpdateOptions>
 
+// missed is spelled out rather than derived from the core's exported scheduleMissedPolicies: the
+// proxy builds against a published pg-boss, and the constant is only public from 12.31.0. It moves
+// to the export at the next dependency bump, as the kind enum below does.
 export const scheduleOptionsSchema = sendOptionsSchemaBase.extend({
   tz: z.string().optional(),
   key: z.string().optional(),
+  missed: z.enum(['skip', 'once']).optional(),
 }) satisfies z.ZodType<types.HttpScheduleOptions>
 
 export const fetchOptionsSchema = z.object({
@@ -245,10 +249,16 @@ export const queueResultSchema = z.object({
 export const scheduleSchema = z.object({
   name: z.string(),
   key: z.string(),
+  kind: z.enum(['cron', 'rrule']),
   cron: z.string(),
   timezone: z.string(),
   data: jsonRecordSchema.optional(),
-  options: sendOptionsSchema.optional(),
+  // The stored blob is what schedule() was given, so tz, key and missed are in it as well. Parsing
+  // it as send options alone would strip all three out of every schedule read back.
+  options: scheduleOptionsSchema.optional(),
+  createdOn: z.iso.datetime().transform((val) => new Date(val)),
+  updatedOn: z.iso.datetime().transform((val) => new Date(val)),
+  lastJobId: z.string().nullable(),
 }) satisfies z.ZodType<types.HttpSchedule>
 
 export const bamStatusSummarySchema = z.object({
@@ -661,6 +671,16 @@ export const unscheduleResponseSchema: z.ZodType<types.HttpUnscheduleResponse> =
 export const getSchedulesResponseSchema: z.ZodType<types.HttpGetSchedulesResponse> = z.object({
   ok: z.literal(true),
   result: z.array(scheduleSchema)
+})
+
+export const getScheduleResponseSchema: z.ZodType<types.HttpGetScheduleResponse> = z.object({
+  ok: z.literal(true),
+  result: scheduleSchema.nullable()
+})
+
+export const previewScheduleResponseSchema: z.ZodType<types.HttpPreviewScheduleResponse> = z.object({
+  ok: z.literal(true),
+  result: z.array(z.iso.datetime().transform((val) => new Date(val)))
 })
 
 export const getBamStatusResponseSchema: z.ZodType<types.HttpGetBamStatusResponse> = z.object({
