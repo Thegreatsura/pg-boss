@@ -2,9 +2,8 @@
 name: Deploy docs
 
 on:
-  push:
-    branches: [master]
-    paths: ['docs/**', '.github/workflows/docs.yml', 'package.json']
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -18,12 +17,19 @@ concurrency:
 
 jobs:
   build:
-    if: github.repository == 'timgit/pg-boss'
+    # Docs ship at release time, not on merge to master. Dashboard and proxy
+    # releases carry their own tags and must not redeploy the core docs site.
+    if: >-
+      github.repository == 'timgit/pg-boss' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (!startsWith(github.event.release.tag_name, 'dashboard-') &&
+        !startsWith(github.event.release.tag_name, 'proxy-')))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # lastUpdated in docs config needs full git history
+          ref: ${{ github.event.release.tag_name || github.ref }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
