@@ -7,7 +7,8 @@ import configJson from './config.json' with { type: 'json' }
 import cockroachConfigJson from './config.cockroachdb.json' with { type: 'json' }
 import yugabyteConfigJson from './config.yugabytedb.json' with { type: 'json' }
 import citusConfigJson from './config.citus.json' with { type: 'json' }
-import type { ConstructorOptions, IDatabase, FetchOptions, Job } from '../src/types.ts'
+import type { ConstructorOptions, ResolvedConstructorOptions, IDatabase, FetchOptions, Job } from '../src/types.ts'
+import * as Attorney from '../src/attorney.ts'
 import { delay } from '../src/tools.ts'
 import { getColumns, getConstraints, getIndexes, getFunctions } from './pgSchemaHelper.ts'
 
@@ -95,7 +96,11 @@ function getConnectionString (): string {
   return `postgres://${config.user}:${config.password}@${config.host}:${config.port}/${config.database}`
 }
 
-function getConfig (options: Partial<ConstructorOptions> & { testKey?: string } = {}): ConstructorOptions {
+// Returns a RESOLVED config - the compatibility flags expanded, not just the backend named. A raw
+// ConstructorOptions is what a caller hands PgBoss, which resolves it internally; anything built
+// straight from this config (a Contractor, a bare plans.create) would otherwise read every flag as
+// undefined and emit stock-PostgreSQL SQL no matter which backend the suite is pointed at.
+function getConfig (options: Partial<ConstructorOptions> & { testKey?: string } = {}): ResolvedConstructorOptions {
   const baseConfig = isCockroachDb ? cockroachConfigJson : isYugabyteDb ? yugabyteConfigJson : isCitus ? citusConfigJson : configJson
   const config: any = { ...baseConfig }
 
@@ -142,7 +147,8 @@ function getConfig (options: Partial<ConstructorOptions> & { testKey?: string } 
     config.db = fromPglite(getPgliteInstance())
   }
 
-  return Object.assign(config, options)
+  // Resolve last: options merged after this point would otherwise be read without their flags.
+  return Attorney.getConfig(Object.assign(config, options)) as ResolvedConstructorOptions
 }
 
 // Maps the active DB_TYPE to the docker compose command that starts its container(s). The default

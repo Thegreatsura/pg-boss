@@ -213,6 +213,34 @@ helper.describePostgresOnly('monitor backoff', function () {
     expect(new Date(stamped).getTime()).toBeGreaterThanOrEqual(before.getTime())
   })
 
+  it('paces a queue that has never been claimed off the last time its counts were written', async function () {
+    // The v40 upgrade seeds monitor_claim_on from monitor_on so an upgraded deployment does not make
+    // every queue eligible at once and stampede one whole-table aggregate per queue on the first
+    // pass after deploy. CockroachDB cannot run that seed - it is a write to a column added in the
+    // same transaction - so the claim reads monitor_on itself when the claim was never stamped, and
+    // the pacing holds on every backend rather than only the ones whose migration could write it.
+    const boss = await startBoss({ monitorIntervalSeconds: 60 })
+
+    await boss.supervise()
+
+    helper.assertTruthy(await monitorOn(ctx.schema, 'backoff'))
+
+    // exactly the state a v40 upgrade leaves on a backend that skipped the seed
+    await query(`UPDATE ${ctx.schema}.queue SET monitor_claim_on = NULL WHERE name = 'backoff'`)
+
+    const claim = plans.trySetQueueMonitorTime(ctx.schema, ['backoff'], 60)
+    expect(await query(claim.text, claim.values)).toHaveLength(0)
+
+    // and it is the fallback doing the work, not a blanket refusal: age monitor_on past the interval
+    // and the same queue is claimed.
+    await query(`UPDATE ${ctx.schema}.queue SET monitor_on = now() - interval '1 day' WHERE name = 'backoff'`)
+    expect(await query(claim.text, claim.values)).toHaveLength(1)
+
+    // a queue with neither stamp is new, not upgraded, and stays immediately eligible
+    await query(`UPDATE ${ctx.schema}.queue SET monitor_claim_on = NULL, monitor_on = NULL WHERE name = 'backoff'`)
+    expect(await query(claim.text, claim.values)).toHaveLength(1)
+  })
+
   it('never shortens a deadline another instance already set', async function () {
     const boss = await startBoss({ __test__monitor_stats_seconds: 300 })
 

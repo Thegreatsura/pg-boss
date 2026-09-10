@@ -1099,6 +1099,17 @@ function getMinVersion (schema: string): number {
   return Math.min(...getAll(schema).map(i => i.previous))
 }
 
+// The migration set shaped for a resolved config, so the flag order lives in one place rather than
+// at every positional call site (contractor, the CLI, tests that inject a list).
+function getAllForConfig (config: Pick<types.ResolvedConstructorOptions, 'schema' | 'noTablePartitioning' | 'noCoveringIndexes' | 'noAddColumnBackfill'>): types.Migration[] {
+  return getAll(config.schema, config.noTablePartitioning, config.noCoveringIndexes, config.noAddColumnBackfill)
+}
+
+// Authoring note on seeding a column you just added: that write is rejected by a backend where
+// ADD COLUMN is a schema-change job (CockroachDB, see noAddColumnBackfill), so gate it on that flag
+// and give the runtime a way to read the same answer without it - v40 falls back to monitor_on, v41
+// relabels on the first cron pass. When the seeded value cannot be recomputed at read time, gating
+// it out loses data: enqueue it as a bam row instead, so it runs after the migration commits.
 function getAll (schema: string, noPartitioning = false, noCovering = false, noAddColumnBackfill = false): types.Migration[] {
   return [
     {
@@ -1549,7 +1560,15 @@ function getAll (schema: string, noPartitioning = false, noCovering = false, noA
         `ALTER TABLE ${schema}.queue ADD COLUMN IF NOT EXISTS monitor_claim_on timestamp with time zone`,
         // Seed the claim from the existing pace so an upgrade does not make every queue immediately
         // eligible and stampede one aggregate per queue on the first supervise pass after deploy.
-        `UPDATE ${schema}.queue SET monitor_claim_on = monitor_on WHERE monitor_claim_on IS NULL`,
+        //
+        // Left out on a backend that cannot write a column in the transaction that added it
+        // (CockroachDB, see noAddColumnBackfill), where it fails the whole migration with
+        // "column is being backfilled" and is what kept a CockroachDB deployment on schema 39 from
+        // reaching 40 at all. Nothing is lost by omitting it: trySetQueueMonitorTime falls back to
+        // monitor_on when the claim is NULL, which is the value this statement would have written.
+        ...(noAddColumnBackfill
+          ? []
+          : [`UPDATE ${schema}.queue SET monitor_claim_on = monitor_on WHERE monitor_claim_on IS NULL`]),
         ...(noPartitioning
           // Single transaction, so both statements commit together and no window exists to protect.
           ? [
@@ -1657,5 +1676,6 @@ export {
   migrate,
   migrateCommands,
   getAll,
+  getAllForConfig,
   getMinVersion,
 }

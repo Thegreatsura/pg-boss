@@ -819,6 +819,7 @@ function applyFlowConfig (config: any) {
 
 export {
   assertKey,
+  COMPATIBILITY_FLAGS,
   assertPostgresObjectName,
   assertQueueName,
   checkFetchArgs,

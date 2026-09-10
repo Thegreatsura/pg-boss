@@ -4,6 +4,7 @@ import * as helper from './testHelper.ts'
 import * as plans from '../src/plans.ts'
 import * as drifter from '../src/drifter.ts'
 import Contractor from '../src/contractor.ts'
+import * as Attorney from '../src/attorney.ts'
 import packageJson from '../package.json' with { type: 'json' }
 
 const schemaVersion = packageJson.pgboss.schema as number
@@ -875,7 +876,7 @@ describe('drift', function () {
           return { rows: [] }
         }
       }
-      const contractor = new Contractor(db as any, { schema: 'pgboss' } as any)
+      const contractor = new Contractor(db as any, Attorney.getConfig({ schema: 'pgboss' }))
       const report = await contractor.detectDrift()
 
       // the throwing queries SKIP their checks; the scan still produced a report and did not false-flag.
@@ -910,7 +911,7 @@ describe('drift', function () {
           return { rows: [] }
         }
       }
-      const contractor = new Contractor(db as any, { schema: 'pgboss' } as any)
+      const contractor = new Contractor(db as any, Attorney.getConfig({ schema: 'pgboss' }))
       const report = await contractor.detectDrift()
 
       // fell back to the column-derived table set (which covers every expected table) — no false missing.
@@ -922,13 +923,13 @@ describe('drift', function () {
       // schema directly and drive a Contractor to cover detectDrift's non-partitioned branch (job
       // indexes live on `job`, no job_common) and the bam-table-absent query fallback. The dropped
       // bam table is itself reported as a missing table.
-      const npSchema = `${ctx.schema}_np`
+      const npSchema = `${ctx.schema.slice(0, 44)}np`
       const db = await helper.getDb()
       try {
         await db.executeSql(plans.create(npSchema, schemaVersion, { createSchema: true, noTablePartitioning: true }))
         await db.executeSql(`DROP TABLE ${npSchema}.bam`)
 
-        const contractor = new Contractor(db, { schema: npSchema } as any)
+        const contractor = new Contractor(db, Attorney.getConfig({ schema: npSchema }))
         const report = await contractor.detectDrift()
 
         // indexes/columns/constraints are clean; only the dropped bam table is drift
@@ -1073,7 +1074,7 @@ describe('drift', function () {
 
     it('skips type/default/constraint checks on the cockroachdb backend', async function () {
       if (helper.isCockroachDb) return // this exercises the CRDB gate while running on Postgres
-      const gateSchema = `${ctx.schema}_crdb_gate`
+      const gateSchema = `${ctx.schema.slice(0, 42)}gate`
       const db = await helper.getDb()
       try {
         await db.executeSql(plans.create(gateSchema, schemaVersion, { createSchema: true }))
@@ -1081,12 +1082,12 @@ describe('drift', function () {
         await db.executeSql(`ALTER TABLE ${gateSchema}.queue ALTER COLUMN retry_limit TYPE bigint`)
 
         // ...is ignored when the contractor thinks it is talking to CockroachDB (INT8 typing differs).
-        const crdb = new Contractor(db, { schema: gateSchema, backend: 'cockroachdb' } as any)
+        const crdb = new Contractor(db, Attorney.getConfig({ schema: gateSchema, backend: 'cockroachdb' }))
         const crdbReport = await crdb.detectDrift()
         expect(crdbReport.columnDrift).toHaveLength(0)
 
         // The same schema on the Postgres profile does flag the type drift.
-        const pg = new Contractor(db, { schema: gateSchema, backend: 'postgres' } as any)
+        const pg = new Contractor(db, Attorney.getConfig({ schema: gateSchema, backend: 'postgres' }))
         const pgReport = await pg.detectDrift()
         expect(pgReport.columnDrift.find(c => c.table === 'queue')!.typeMismatches.map(m => m.column)).toContain('retry_limit')
       } finally {

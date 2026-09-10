@@ -7,6 +7,7 @@ import Db from './db.ts'
 import * as plans from './plans.ts'
 import Contractor from './contractor.ts'
 import * as migrationStore from './migrationStore.ts'
+import * as attorney from './attorney.ts'
 import packageJson from '../package.json' with { type: 'json' }
 import type * as types from './types.ts'
 
@@ -21,6 +22,7 @@ interface CliConfig {
   connectionString?: string
   schema?: string
   ssl?: boolean | object
+  backend?: types.BackendProfile
 }
 
 function printHelp (): void {
@@ -49,6 +51,8 @@ Options:
   --password, -p <pass>   Database password
   --connection-string     Full connection string (overrides other connection options)
   --ssl                   Enable SSL connection
+  --backend <profile>     Database backend: postgres (default), cockroachdb, yugabytedb, citus.
+                          Non-postgres backends need this to emit schema they accept.
   --dry-run               Output SQL without executing (for plans and reindex commands)
   --force                 Rebuild every job index, not just the bloated ones (reindex)
 
@@ -60,6 +64,7 @@ Environment Variables:
   PGBOSS_USER             Database user
   PGBOSS_PASSWORD         Database password
   PGBOSS_SCHEMA           Schema name (default: pgboss)
+  PGBOSS_BACKEND          Database backend profile (default: postgres)
 
 Config File (pgboss.json):
   {
@@ -69,7 +74,8 @@ Config File (pgboss.json):
     "user": "postgres",
     "password": "secret",
     "schema": "pgboss",
-    "ssl": false
+    "ssl": false,
+    "backend": "postgres"
   }
 
 Examples:
@@ -77,6 +83,7 @@ Examples:
   pg-boss migrate --schema my_schema
   pg-boss create --connection-string postgres://user:pass@localhost/db
   pg-boss plans migrate --dry-run
+  pg-boss migrate --backend cockroachdb --connection-string postgres://root@localhost:26257/db
   pg-boss version
   PGBOSS_DATABASE_URL=postgres://localhost/mydb pg-boss migrate
 `)
@@ -108,10 +115,17 @@ function loadConfigFile (configPath?: string): CliConfig {
   return {}
 }
 
-function getConnectionConfig (args: ReturnType<typeof parseCliArgs>): types.DatabaseOptions {
+// Resolves the connection AND the backend compatibility flags, because every command that writes
+// schema needs both. Without the flags a CockroachDB target is handed stock-PostgreSQL DDL - table
+// partitioning, advisory locks, covering indexes, a backfill of a column added in the same
+// transaction - and the command fails partway through a migration rather than up front. The flags
+// are derived from --backend / PGBOSS_BACKEND / the config file by the same attorney.getConfig() the
+// library constructor uses, so the CLI and a running boss cannot disagree about what a backend
+// supports.
+function getConnectionConfig (args: ReturnType<typeof parseCliArgs>): types.ResolvedConstructorOptions {
   const fileConfig = loadConfigFile(args.config)
 
-  const config: types.DatabaseOptions = {
+  const config: types.ConstructorOptions = {
     connectionString: args.connectionString || process.env.PGBOSS_DATABASE_URL || fileConfig.connectionString,
     host: args.host || process.env.PGBOSS_HOST || fileConfig.host,
     port: args.port ? parseInt(args.port, 10) : (process.env.PGBOSS_PORT ? parseInt(process.env.PGBOSS_PORT, 10) : fileConfig.port),
@@ -132,7 +146,31 @@ function getConnectionConfig (args: ReturnType<typeof parseCliArgs>): types.Data
     process.exit(1)
   }
 
-  return config
+  return resolveBackendConfig(config, args, fileConfig)
+}
+
+// Runs a config through the library's own resolver so the compatibility flags come from one place.
+// Split out of getConnectionConfig because `plans` has to answer offline, where there is a backend
+// to honour but no connection to read.
+function resolveBackendConfig (config: types.ConstructorOptions, args: ReturnType<typeof parseCliArgs>, fileConfig: CliConfig): types.ResolvedConstructorOptions {
+  const backend = args.backend || process.env.PGBOSS_BACKEND || fileConfig.backend
+
+  if (backend) {
+    // pglite is in-process and has no connection string, so it can only be driven from library code.
+    if (backend === 'pglite') {
+      console.error('Error: the pglite backend is in-process and cannot be used from the CLI.')
+      process.exit(1)
+    }
+
+    config.backend = backend as types.BackendProfile
+  }
+
+  try {
+    return attorney.getConfig(config)
+  } catch (err: any) {
+    console.error(`Error: ${err.message}`)
+    process.exit(1)
+  }
 }
 
 function parseCliArgs () {
@@ -148,6 +186,7 @@ function parseCliArgs () {
       password: { type: 'string', short: 'p' },
       'connection-string': { type: 'string' },
       ssl: { type: 'boolean' },
+      backend: { type: 'string' },
       'dry-run': { type: 'boolean' },
       force: { type: 'boolean' }
     },
@@ -165,6 +204,7 @@ function parseCliArgs () {
     password: values.password,
     connectionString: values['connection-string'],
     ssl: values.ssl,
+    backend: values.backend,
     dryRun: values['dry-run'],
     force: values.force,
     command: positionals[0],
@@ -180,7 +220,7 @@ async function createDb (config: types.DatabaseOptions): Promise<Db> {
 
 // Like getConnectionConfig, but returns null instead of exiting when no connection is
 // configured — used by commands (e.g. `plans`) where a connection is optional.
-function tryGetConnectionConfig (args: ReturnType<typeof parseCliArgs>): types.DatabaseOptions | null {
+function tryGetConnectionConfig (args: ReturnType<typeof parseCliArgs>): types.ResolvedConstructorOptions | null {
   const fileConfig = loadConfigFile(args.config)
 
   const hasConnection =
@@ -244,7 +284,7 @@ async function cmdCreate (args: ReturnType<typeof parseCliArgs>): Promise<void> 
   const schema = config.schema || plans.DEFAULT_SCHEMA
 
   if (args.dryRun) {
-    const sql = plans.create(schema, schemaVersion, { createSchema: true })
+    const sql = plans.create(schema, schemaVersion, { ...config, createSchema: true })
     console.log('-- SQL to create pg-boss schema:')
     console.log(sql)
     return
@@ -260,7 +300,7 @@ async function cmdCreate (args: ReturnType<typeof parseCliArgs>): Promise<void> 
     }
 
     console.log(`Creating pg-boss schema "${schema}"...`)
-    const sql = plans.create(schema, schemaVersion, { createSchema: true })
+    const sql = plans.create(schema, schemaVersion, { ...config, createSchema: true })
     await db.executeSql(sql)
     console.log(`Successfully created pg-boss schema "${schema}" at version ${schemaVersion}`)
   } finally {
@@ -299,7 +339,7 @@ async function cmdMigrate (args: ReturnType<typeof parseCliArgs>): Promise<void>
     // Offline (or not yet installed) we can't know it, so fall back to the oldest supported starting
     // version — the full chain — instead of a bogus "from 0" that fails on non-idempotent steps.
     const fromVersion = version ?? migrationStore.getMinVersion(schema)
-    const sql = migrationStore.migrate(schema, fromVersion, undefined, undefined, { inlineAsync: true, partitionTables })
+    const sql = migrationStore.migrate(schema, fromVersion, migrationStore.getAllForConfig(config), config.noAdvisoryLocks, { inlineAsync: true, partitionTables })
     console.log(`-- SQL to migrate pg-boss from version ${fromVersion} to ${schemaVersion}:`)
     console.log(sql)
     return
@@ -312,7 +352,7 @@ async function cmdMigrate (args: ReturnType<typeof parseCliArgs>): Promise<void>
 
     if (version === null) {
       console.log(`pg-boss is not installed. Creating schema "${schema}"...`)
-      const sql = plans.create(schema, schemaVersion, { createSchema: true })
+      const sql = plans.create(schema, schemaVersion, { ...config, createSchema: true })
       await db.executeSql(sql)
       console.log(`Successfully created pg-boss schema "${schema}" at version ${schemaVersion}`)
       return
@@ -327,7 +367,7 @@ async function cmdMigrate (args: ReturnType<typeof parseCliArgs>): Promise<void>
     // Inline the async index builds rather than enqueuing BAM rows that nothing will run
     // (the CLI exits without a worker); enumerate partitions so they are covered too.
     const partitionTables = await getPartitionTables(db, schema)
-    const { sql, concurrent } = migrationStore.migrateCommands(schema, version, undefined, undefined, { inlineAsync: true, partitionTables })
+    const { sql, concurrent } = migrationStore.migrateCommands(schema, version, migrationStore.getAllForConfig(config), config.noAdvisoryLocks, { inlineAsync: true, partitionTables })
     await db.executeSql(sql)
     // CONCURRENTLY index builds must run outside the migration transaction, one at a time.
     for (const statement of concurrent) {
@@ -359,14 +399,14 @@ async function cmdRollback (args: ReturnType<typeof parseCliArgs>): Promise<void
     }
 
     if (args.dryRun) {
-      const sql = migrationStore.rollback(schema, version)
+      const sql = migrationStore.rollback(schema, version, migrationStore.getAllForConfig(config), config.noAdvisoryLocks)
       console.log(`-- SQL to rollback pg-boss from version ${version} to ${version - 1}:`)
       console.log(sql)
       return
     }
 
     console.log(`Rolling back pg-boss schema "${schema}" from version ${version} to ${version - 1}...`)
-    const sql = migrationStore.rollback(schema, version)
+    const sql = migrationStore.rollback(schema, version, migrationStore.getAllForConfig(config), config.noAdvisoryLocks)
     await db.executeSql(sql)
     console.log(`Successfully rolled back pg-boss schema "${schema}" to version ${version - 1}`)
   } finally {
@@ -396,7 +436,7 @@ async function cmdDoctor (args: ReturnType<typeof parseCliArgs>): Promise<void> 
     // catalog queries + computeSchemaDrift wiring here (the two copies had already drifted apart and
     // carried divergent best-effort/backend-gating bugs). Contractor.detectDrift handles the
     // partitioned probe, best-effort catalog fallbacks, and backend-specific gating in one place.
-    const contractor = new Contractor(db, { ...config, schema } as unknown as types.ResolvedConstructorOptions)
+    const contractor = new Contractor(db, { ...config, schema })
     const report = await contractor.detectDrift()
 
     if (report.building.length) {
@@ -537,6 +577,15 @@ async function cmdReindex (args: ReturnType<typeof parseCliArgs>): Promise<void>
       return
     }
 
+    // A declared backend answers this without a round trip: REINDEX is rejected outright on
+    // CockroachDB and unimplemented on YugabyteDB, and neither can measure bloat in the first place.
+    if (config.noReindex) {
+      console.error(`Reindexing is not supported on the ${config.backend} backend.`)
+      console.error('Index maintenance there is handled by the storage engine, and the bloat check cannot run: pg_class.relpages and pg_relation_size() are unavailable or always zero.')
+      process.exitCode = 1
+      return
+    }
+
     const sql = args.force ? plans.getJobIndexes(schema) : plans.getBloatedIndexes(schema)
 
     let rows: any[]
@@ -546,9 +595,8 @@ async function cmdReindex (args: ReturnType<typeof parseCliArgs>): Promise<void>
     } catch (err: any) {
       // The check reads pg_class.relpages and pg_relation_size(). CockroachDB has neither (it
       // rejects `reltuples / relpages` as an unsupported binary operator) and YugabyteDB reports
-      // zeroes for every relation. The CLI takes a connection string, not a backend profile, so
-      // there is nothing to gate on ahead of time — say what happened instead of surfacing a raw
-      // catalog error.
+      // zeroes for every relation. --backend catches those up front (above); this stays for a target
+      // that was not declared — say what happened instead of surfacing a raw catalog error.
       console.error(`Could not read index statistics from schema "${schema}": ${err.message}`)
       console.error('The bloat check reads pg_class.relpages and pg_relation_size(), which CockroachDB and YugabyteDB do not provide.')
       process.exitCode = 1
@@ -630,12 +678,15 @@ async function cmdPlans (args: ReturnType<typeof parseCliArgs>): Promise<void> {
   const fileConfig = loadConfigFile(args.config)
   const schema = args.schema || process.env.PGBOSS_SCHEMA || fileConfig.schema || plans.DEFAULT_SCHEMA
   const subCommand = args.subCommand || 'migrate'
+  // A connection is optional here, but the backend is not: printed SQL is meant to be run, so it has
+  // to be the SQL that backend accepts.
+  const config = resolveBackendConfig({ schema }, args, fileConfig)
 
   switch (subCommand) {
     case 'create':
     case 'construct':
       console.log('-- SQL to create pg-boss schema:')
-      console.log(plans.create(schema, schemaVersion, { createSchema: true }))
+      console.log(plans.create(schema, schemaVersion, { ...config, createSchema: true }))
       break
 
     case 'migrate': {
@@ -663,13 +714,13 @@ async function cmdPlans (args: ReturnType<typeof parseCliArgs>): Promise<void> {
         console.log('-- note: no database connection provided; partitioned queue tables were not enumerated.')
         console.log('-- Run with a connection (e.g. --connection-string) to include per-partition index builds.')
       }
-      console.log(migrationStore.migrate(schema, 0, undefined, undefined, { inlineAsync: true, partitionTables }))
+      console.log(migrationStore.migrate(schema, 0, migrationStore.getAllForConfig(config), config.noAdvisoryLocks, { inlineAsync: true, partitionTables }))
       break
     }
 
     case 'rollback':
       console.log(`-- SQL to rollback pg-boss from version ${schemaVersion} to ${schemaVersion - 1}:`)
-      console.log(migrationStore.rollback(schema, schemaVersion))
+      console.log(migrationStore.rollback(schema, schemaVersion, migrationStore.getAllForConfig(config), config.noAdvisoryLocks))
       break
 
     default:

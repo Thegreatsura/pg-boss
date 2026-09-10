@@ -114,6 +114,38 @@ describePglite('cli', function () {
       })
     })
 
+    it('should shape plans for the declared backend, not for stock postgres', async function () {
+      // The CLI takes a connection string, which says nothing about which engine answers it. Without
+      // --backend it emits stock-PostgreSQL schema, and a CockroachDB target then fails partway
+      // through a migration on partitioning, advisory locks or a column written in the transaction
+      // that added it. Asserted on printed SQL so it needs no cluster.
+      const postgres = await execCommand(`node ${cliPath} plans create`)
+      const cockroach = await execCommand(`node ${cliPath} plans create --backend cockroachdb`)
+
+      expect(postgres.stdout).toContain('PARTITION BY LIST')
+      expect(cockroach.stdout).not.toContain('PARTITION BY LIST')
+
+      const migratePostgres = await execCommand(`node ${cliPath} plans migrate`)
+      const migrateCockroach = await execCommand(`node ${cliPath} plans migrate --backend cockroachdb`)
+
+      expect(migratePostgres.stdout).toContain('pg_advisory_xact_lock')
+      expect(migrateCockroach.stdout).not.toContain('pg_advisory_xact_lock')
+
+      // and the same-transaction backfill, which is the statement that blocked the upgrade outright
+      expect(migratePostgres.stdout).toMatch(/UPDATE \S+\.queue SET monitor_claim_on/)
+      expect(migrateCockroach.stdout).not.toMatch(/UPDATE \S+\.queue SET monitor_claim_on/)
+    })
+
+    it('should reject an unknown backend and the library-only one', async function () {
+      await execCommand(`node ${cliPath} plans create --backend oracle`, {
+        expectedErrorMessage: 'backend must be one of'
+      })
+
+      await execCommand(`node ${cliPath} plans create --backend pglite`, {
+        expectedErrorMessage: 'cannot be used from the CLI'
+      })
+    })
+
     it('should error on unknown plans subcommand', async function () {
       await execCommand(`node ${cliPath} plans unknown`, {
         expectedErrorMessage: 'Unknown plans subcommand'

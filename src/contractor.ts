@@ -2,6 +2,7 @@ import assert from 'node:assert'
 import * as plans from './plans.ts'
 import * as drifter from './drifter.ts'
 import * as migrationStore from './migrationStore.ts'
+import { COMPATIBILITY_FLAGS } from './attorney.ts'
 import packageJson from '../package.json' with { type: 'json' }
 import type * as types from './types.ts'
 
@@ -31,9 +32,19 @@ class Contractor {
   private migrations: types.Migration[]
 
   constructor (db: types.IDatabase, config: types.ResolvedConstructorOptions) {
+    // Every statement this class emits is shaped by the compatibility flags, and an unset flag is
+    // read as false - stock PostgreSQL. So a config that never went through attorney.getConfig()
+    // does not fail here, it quietly emits partitioned DDL, advisory locks and covering indexes at a
+    // backend that rejects them, halfway through a migration. Assert instead: the flags are always
+    // booleans once resolved, so their absence is exactly the mistake worth catching.
+    for (const flag of COMPATIBILITY_FLAGS) {
+      assert(typeof config[flag] === 'boolean',
+        `contractor assert: config was not resolved (${flag} is ${typeof config[flag]}). Pass a config from attorney.getConfig().`)
+    }
+
     this.config = config
     this.db = db
-    this.migrations = this.config.migrations || migrationStore.getAll(this.config.schema, this.config.noTablePartitioning, this.config.noCoveringIndexes, this.config.noAddColumnBackfill)
+    this.migrations = this.config.migrations || migrationStore.getAllForConfig(this.config)
   }
 
   async schemaVersion () {

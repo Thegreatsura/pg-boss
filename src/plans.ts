@@ -216,6 +216,11 @@ function createTableVersion (schema: string) {
   `
 }
 
+// Two stamps, not one. monitor_claim_on is the interval claim that decides which instance runs a
+// monitor pass; monitor_on is when this queue's counts were actually written, and is stamped only by
+// the aggregate that wrote them (see cacheQueueStats). Splitting them is what lets a pass be claimed
+// and then skip the aggregate - because the vacuum backoff is in force, or because another instance
+// holds the stats try-lock - without capturedOn claiming a freshness the counts do not have.
 function createTableQueue (schema: string) {
   return `
     CREATE TABLE ${schema}.queue (
@@ -242,12 +247,6 @@ function createTableQueue (schema: string) {
       heartbeat_seconds int,
       notify bool NOT NULL DEFAULT false,
       singletons_active text[],
-      -- Two stamps, not one. monitor_claim_on is the interval claim that decides which instance
-      -- runs a monitor pass; monitor_on is when this queue's counts were actually written, and is
-      -- stamped only by the aggregate that wrote them (see cacheQueueStats). Splitting them is what
-      -- lets a pass be claimed and then skip the aggregate — because the vacuum backoff is in force,
-      -- or because another instance holds the stats try-lock — without capturedOn claiming a
-      -- freshness the counts do not have.
       monitor_claim_on timestamp with time zone,
       monitor_on timestamp with time zone,
       maintain_on timestamp with time zone,
@@ -897,13 +896,22 @@ function createIndexJobBlocking (schema: string) {
 // writes the counts (see cacheQueueStats), so a pass that claims and then skips the aggregate -
 // backed off, or beaten to the stats try-lock - leaves capturedOn correctly aging instead of
 // advertising a freshness the counts do not have.
+//
+// The NULL fallback reads monitor_on before it gives up and reports the queue eligible. A queue that
+// has never been claimed but has been monitored is one that crossed the v40 upgrade: v40 added
+// monitor_claim_on and seeds it from monitor_on so the first pass after a deploy does not make every
+// queue eligible at once, and that seed is the statement CockroachDB cannot run in the transaction
+// that added the column (see noAddColumnBackfill). Falling back to monitor_on here produces the
+// seeded answer without the seed, so the stampede is closed on every backend rather than only on the
+// ones whose migration could write the column. A genuinely new queue has neither stamp and stays
+// immediately eligible, which is what it should be.
 export function trySetQueueMonitorTime (schema: string, queues: string[], seconds: number): SqlQuery {
   return {
     text: `
     UPDATE ${schema}.queue
     SET monitor_claim_on = now()
     WHERE name = ANY($1::text[])
-      AND EXTRACT( EPOCH FROM (now() - COALESCE(monitor_claim_on, now() - interval '1 week') ) ) > ${seconds}
+      AND EXTRACT( EPOCH FROM (now() - COALESCE(monitor_claim_on, monitor_on, now() - interval '1 week') ) ) > ${seconds}
     RETURNING name, NOT EXISTS (SELECT 1 FROM ${schema}.version WHERE monitor_backoff_on > now()) as "refreshStats"
   `,
     values: [queues]
@@ -2053,6 +2061,15 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
   // the NOTIFY on immediate availability, regardless of whether the caller wants ids.
   const returning = notify ? 'RETURNING id, start_after' : returnId ? 'RETURNING id' : ''
 
+  // A caller that knows the slot names it outright: the cron pass files a rule occurrence in the
+  // slot the occurrence falls in, and an offset off now() cannot pin that, since now() here is
+  // insert time. Only in the statement the pass asks for, because insert() stringifies caller
+  // objects straight into the recordset below, so a column declared for everyone would be a live,
+  // undeclared and unvalidated option on the public path, where a bad value surfaces as a raw
+  // postgres error. Prefixed as well, and not called singletonOn, which is a column fetching a job
+  // hands back, so a job read from one queue and inserted into another cannot fill it in by accident.
+  const slotClause = slots ? 'WHEN "__singletonSlot" IS NOT NULL THEN CAST("__singletonSlot" as timestamp)' : ''
+
   const insert = `
     INSERT INTO ${schema}.${table} (
       id,
@@ -2086,15 +2103,7 @@ export function insertJobs (schema: string, { table, name, returnId = true, noti
       j.start_after,
       "singletonKey",
       CASE
-        -- A caller that knows the slot names it outright: the cron pass files a rule occurrence in
-        -- the slot the occurrence falls in, and an offset off now() cannot pin that, since now()
-        -- here is insert time. Only in the statement the pass asks for, because insert()
-        -- stringifies caller objects straight into the recordset below, so a column declared for
-        -- everyone would be a live, undeclared and unvalidated option on the public path, where a
-        -- bad value surfaces as a raw postgres error. Prefixed as well, and not called singletonOn,
-        -- which is a column fetching a job hands back, so a job read from one queue and inserted
-        -- into another cannot fill it in by accident.
-        ${slots ? 'WHEN "__singletonSlot" IS NOT NULL THEN CAST("__singletonSlot" as timestamp)' : ''}
+        ${slotClause}
         WHEN "singletonSeconds" IS NOT NULL THEN 'epoch'::timestamp + '1s'::interval * ("singletonSeconds"::float8 * floor(( date_part('epoch', now()) + COALESCE("singletonOffset",0)::float8) / "singletonSeconds"::float8 ))
         ELSE NULL
         END as singleton_on,

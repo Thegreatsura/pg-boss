@@ -150,7 +150,7 @@ The CLI supports multiple ways to configure the database connection, in order of
    PGBOSS_SCHEMA=myapp_jobs pg-boss migrate
    ```
 
-   Supported: `PGBOSS_DATABASE_URL`, `PGBOSS_HOST`, `PGBOSS_PORT`, `PGBOSS_DATABASE`, `PGBOSS_USER`, `PGBOSS_PASSWORD`, `PGBOSS_SCHEMA`.
+   Supported: `PGBOSS_DATABASE_URL`, `PGBOSS_HOST`, `PGBOSS_PORT`, `PGBOSS_DATABASE`, `PGBOSS_USER`, `PGBOSS_PASSWORD`, `PGBOSS_SCHEMA`, `PGBOSS_BACKEND`.
 
    This allows admin credentials for migrations to coexist with regular application database credentials (e.g., `DATABASE_URL` for the app, `PGBOSS_DATABASE_URL` for migrations).
 
@@ -167,7 +167,8 @@ The CLI supports multiple ways to configure the database connection, in order of
      "database": "mydb",
      "user": "postgres",
      "password": "secret",
-     "schema": "pgboss"
+     "schema": "pgboss",
+     "backend": "postgres"
    }
    ```
 
@@ -184,10 +185,27 @@ The CLI supports multiple ways to configure the database connection, in order of
 | `--schema` | `-s` | pg-boss schema name (default: pgboss) |
 | `--config` | `-c` | Path to config file (default: pgboss.json, .pgbossrc, .pgbossrc.json) |
 | `--ssl` | | Enable SSL connection (`rejectUnauthorized: false`) |
+| `--backend` | | Database backend profile: `postgres` (default), `cockroachdb`, `yugabytedb`, `citus` |
 | `--dry-run` | | Show SQL without executing (for `migrate`, `create`, `rollback`) |
 | `--help` | `-h` | Show help |
 
 > **Note:** `-c` is the short form for `--config` (a config file path), **not** `--connection-string`. The connection string has no short form.
+
+## Backends
+
+A connection string does not say which engine is on the other end of it, and the engines do not accept the same schema. `--backend` (or `PGBOSS_BACKEND`, or `"backend"` in the config file) names the profile, and every command that writes or prints schema — `create`, `migrate`, `rollback`, `plans`, `doctor`, `reindex` — uses it to pick the statements that backend supports. It is the same profile the library constructor takes, so the CLI and a running `PgBoss` produce the same schema.
+
+Without it the CLI assumes stock PostgreSQL, which on CockroachDB means table partitioning, advisory locks, covering indexes and a column written in the transaction that added it — a migration that fails partway rather than up front.
+
+```bash
+# CockroachDB
+pg-boss migrate --backend cockroachdb --connection-string postgres://root@localhost:26257/mydb
+
+# YugabyteDB
+PGBOSS_BACKEND=yugabytedb pg-boss migrate
+```
+
+`pglite` is in-process and has no connection string, so it is library-only and rejected here.
 
 ## Examples
 

@@ -1,20 +1,20 @@
 import { beforeAll, beforeEach, afterEach, expect } from 'vitest'
 import * as helper from './testHelper.ts'
 import { assertTruthy } from './testHelper.ts'
-import type { ConstructorOptions } from '../src/types.ts'
+import type { ResolvedConstructorOptions } from '../src/types.ts'
 import type { PgBoss } from '../src/index.ts'
 import crypto from 'node:crypto'
 
 export interface TestContext {
   boss?: PgBoss
-  bossConfig: ConstructorOptions & { schema: string }
+  bossConfig: ResolvedConstructorOptions & { schema: string }
   schema: string
 }
 
 // Shared test context - each test file gets its own module scope in vitest
 export const ctx: TestContext = {
   boss: undefined,
-  bossConfig: {} as ConstructorOptions & { schema: string },
+  bossConfig: {} as ResolvedConstructorOptions & { schema: string },
   schema: ''
 }
 
@@ -52,7 +52,7 @@ beforeEach(async (context) => {
   console.log(`      ${testName} (schema: ${config.schema})...`)
   await helper.dropSchema(config.schema)
 
-  ctx.bossConfig = config as ConstructorOptions & { schema: string }
+  ctx.bossConfig = config as ResolvedConstructorOptions & { schema: string }
   ctx.schema = config.schema
   ctx.boss = undefined
 })

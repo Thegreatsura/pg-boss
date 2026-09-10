@@ -2,7 +2,7 @@ import { expect } from 'vitest'
 import { getDb, itPglite } from './testHelper.ts'
 import { PgBoss } from '../src/index.ts'
 import Contractor from '../src/contractor.ts'
-import { getAll } from '../src/migrationStore.ts'
+import { getAllForConfig } from '../src/migrationStore.ts'
 import packageJson from '../package.json' with { type: 'json' }
 import { ctx } from './hooks.ts'
 
@@ -42,7 +42,7 @@ describe('multi-master', function () {
 
     expect(oldVersion).not.toBe(currentSchemaVersion)
 
-    config.migrations = getAll(config.schema)
+    config.migrations = getAllForConfig(config)
     config.migrations[0].install.push('select pg_sleep(1)')
 
     const instances = []
