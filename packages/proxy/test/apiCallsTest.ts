@@ -877,7 +877,7 @@ describe('proxy api routes', () => {
     expect(calls.get('getQueues')?.[0]).toEqual([['single']])
   })
 
-  it('GET /api/meta returns states/policies/events', async () => {
+  it('GET /api/meta returns states/policies/events and the schedule enumerations', async () => {
     const { boss } = createBossMock()
     const { app } = await createProxyService({ options: {}, bossFactory: () => boss as any })
 
@@ -890,6 +890,8 @@ describe('proxy api routes', () => {
     expect(body.result.states).toBeDefined()
     expect(body.result.policies).toBeDefined()
     expect(body.result.events).toBeDefined()
+    expect(body.result.scheduleKinds).toEqual({ cron: 'cron', rrule: 'rrule' })
+    expect(body.result.scheduleMissedPolicies).toEqual({ skip: 'skip', once: 'once' })
   })
 
   it('middleware can reject requests with 401', async () => {

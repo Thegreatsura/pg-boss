@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { cronHuman } from '~/routes/schedules'
+import { cronHuman, scheduleHuman } from '~/routes/schedules'
 
 describe('cronHuman', () => {
   it('describes daily times only when day fields are wildcards', () => {
@@ -36,5 +36,20 @@ describe('cronHuman', () => {
     expect(cronHuman('0 4 * * 1-5')).toBe('Custom schedule')
     expect(cronHuman('not a cron')).toBe('Custom schedule')
     expect(cronHuman('0 4 * *')).toBe('Custom schedule')
+  })
+})
+
+describe('scheduleHuman', () => {
+  it('describes a cron row through cronHuman', () => {
+    expect(scheduleHuman('0 2 * * *', 'cron')).toBe('Every day at 02:00')
+    // A row read off a database older than schema v41 has no kind, and is cron.
+    expect(scheduleHuman('0 2 * * *')).toBe('Every day at 02:00')
+  })
+
+  it('labels a recurrence rule rather than describing it', () => {
+    // Read as cron, 'FREQ=DAILY;BYHOUR=8,17' is a single field and would come back 'Custom
+    // schedule'; naming the kind is both true and more use than that.
+    expect(scheduleHuman('FREQ=DAILY;BYHOUR=8,17', 'rrule')).toBe('Recurrence rule')
+    expect(scheduleHuman('FREQ=WEEKLY;BYDAY=MO', 'rrule')).toBe('Recurrence rule')
   })
 })

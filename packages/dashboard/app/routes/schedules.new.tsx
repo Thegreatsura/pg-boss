@@ -24,6 +24,7 @@ export async function action ({ request, context }: Route.ActionArgs) {
 
   const name = formData.get('name') as string | null
   const cron = formData.get('cron') as string | null
+  const missed = formData.get('missed') as string | null
   const timezone = formData.get('timezone') as string | null
   const key = formData.get('key') as string | null
   const dataStr = formData.get('data') as string | null
@@ -37,12 +38,16 @@ export async function action ({ request, context }: Route.ActionArgs) {
   }
 
   if (!cron || !cron.trim()) {
-    return { error: 'Cron expression is required' }
+    return { error: 'An expression is required' }
   }
 
-  // Validate cron format (basic validation)
-  const cronParts = cron.trim().split(/\s+/)
-  if (cronParts.length !== 5) {
+  // The field takes either kind pg-boss stores, so the field-count check only applies to the one it
+  // is about. What tells them apart is what the core uses (src/rrule.ts): an iCalendar property at
+  // the head of a line, or the FREQ part every rule carries — neither of which a cron field can
+  // contain. A rule is left to the core, which validates it far more thoroughly than this could.
+  const isRecurrenceRule = /^[ \t]*[a-z][a-z0-9-]*[;:]|(?:^|[\s;])FREQ=/im.test(cron)
+
+  if (!isRecurrenceRule && cron.trim().split(/\s+/).length !== 5) {
     return { error: 'Cron expression must have 5 parts (minute hour day month weekday)' }
   }
 
@@ -69,6 +74,13 @@ export async function action ({ request, context }: Route.ActionArgs) {
 
   if (key && key.trim()) {
     options.key = key.trim()
+  }
+
+  if (missed && missed.trim()) {
+    if (missed !== 'skip' && missed !== 'once') {
+      return { error: 'Missed occurrence policy must be skip or once' }
+    }
+    options.missed = missed
   }
 
   if (priority && priority.trim()) {
@@ -308,11 +320,11 @@ export default function CreateSchedule ({ loaderData, actionData }: any) {
               </div>
             </div>
 
-            {/* Row 2: Cron Expression and Timezone */}
+            {/* Row 2: Expression and Timezone */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <label htmlFor="cron" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
-                  Cron Expression <span className="text-red-500">*</span>
+                  Expression <span className="text-red-500">*</span>
                 </label>
                 <input
                   type="text"
@@ -328,7 +340,7 @@ export default function CreateSchedule ({ loaderData, actionData }: any) {
                   )}
                 />
                 <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                  Format: minute hour day month weekday
+                  Cron (minute hour day month weekday) or an RRULE, e.g. FREQ=DAILY;BYHOUR=8
                 </p>
               </div>
 
@@ -372,6 +384,30 @@ export default function CreateSchedule ({ loaderData, actionData }: any) {
               />
               <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
                 Optional: JSON object to pass as job data
+              </p>
+            </div>
+
+            <div>
+              <label htmlFor="missed" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                Missed Occurrences
+              </label>
+              <select
+                id="missed"
+                name="missed"
+                defaultValue=""
+                className={cn(
+                  'w-full rounded-lg border px-3 py-2 text-sm',
+                  'bg-white border-gray-300 text-gray-900',
+                  'dark:bg-gray-900 dark:border-gray-700 dark:text-gray-100',
+                  'focus:outline-none focus:ring-2 focus:ring-primary-600 focus:border-transparent'
+                )}
+              >
+                <option value="">Default (skip)</option>
+                <option value="skip">skip — send nothing for a gap</option>
+                <option value="once">once — send one job for the most recent missed occurrence</option>
+              </select>
+              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                What the schedule sends for occurrences that came due while no pass was running
               </p>
             </div>
 

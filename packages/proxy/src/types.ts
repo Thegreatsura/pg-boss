@@ -85,6 +85,8 @@ export type HttpMetaResult = {
   states: Record<string, string>
   policies: Record<string, string>
   events: Record<string, string>
+  scheduleKinds: Record<string, string>
+  scheduleMissedPolicies: Record<string, string>
 }
 
 export type HttpMetaResponse = {

@@ -1,20 +1,27 @@
 // Types based on or imported from pg-boss
-import type { JobWithMetadata, QueuePolicy, QueueResult as PgBossQueueResult } from 'pg-boss'
-export type { JobWithMetadata, QueuePolicy }
+import type { JobWithMetadata, QueuePolicy, QueueResult as PgBossQueueResult, ScheduleKind } from 'pg-boss'
+export type { JobWithMetadata, QueuePolicy, ScheduleKind }
 
 // SendOptions type from pg-boss (defined locally for compatibility)
 // Represents options for sending jobs
 export type SendOptions = Record<string, any>
 
 // ScheduleOptions type from pg-boss (defined locally for compatibility)
-export type ScheduleOptions = SendOptions & { tz?: string; key?: string }
+export type ScheduleOptions = SendOptions & { tz?: string; key?: string; missed?: 'skip' | 'once' }
 
 // Schedule interface from pg-boss (defined locally for compatibility)
 export interface Schedule {
   name: string;
   key: string;
+  // `cron` carries the expression whatever its format and `kind` says which format that is, the way
+  // the schedule table stores them. Both are optional here for the same reason readyHistory is on
+  // QueueResult: the columns arrived with schema v41, and the dashboard also runs against databases
+  // that predate them, where the read leaves them undefined and the UI treats the row as cron.
+  kind?: ScheduleKind;
   cron: string;
   timezone: string;
+  // The job the schedule most recently created (schema v41+), or null before it has created one.
+  lastJobId?: string | null;
   data?: object;
   options?: SendOptions;
 }

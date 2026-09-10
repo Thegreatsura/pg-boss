@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import { ctx, createTestQueue, getBoss, makeContext } from './helpers'
 import { action as sendJobAction } from '~/routes/send'
 import { action as createQueueAction } from '~/routes/queues.create'
+import { action as createScheduleAction } from '~/routes/schedules.new'
 import { getQueue } from '~/lib/queries.server'
 import { schedule, unschedule } from '~/lib/boss.server'
 
@@ -583,5 +584,53 @@ describe('Schedule Functions', () => {
     const boss = getBoss()
     const schedules = await boss.getSchedules()
     expect(schedules.some(s => s.name === 'scheduled-queue')).toBe(false)
+  })
+})
+
+describe('Create Schedule Action', () => {
+  const submit = (fields: Record<string, string>) => createScheduleAction({
+    request: new Request('http://localhost/schedules/new', {
+      method: 'POST',
+      body: Object.entries(fields).reduce((form, [key, value]) => {
+        form.set(key, value)
+        return form
+      }, new FormData()),
+    }),
+    context: makeContext(ctx),
+    params: {},
+  })
+
+  it('stores a recurrence rule as the rrule kind', async () => {
+    await createTestQueue('rule-queue')
+
+    const result = await submit({ name: 'rule-queue', cron: 'FREQ=DAILY;BYHOUR=8;BYMINUTE=0' })
+    expect(result).toBeInstanceOf(Response)
+
+    const [stored] = await getBoss().getSchedules('rule-queue')
+    expect(stored.kind).toBe('rrule')
+    expect(stored.cron).toBe('FREQ=DAILY;BYHOUR=8;BYMINUTE=0')
+  })
+
+  it('keeps the five-field check on cron expressions', async () => {
+    await createTestQueue('cron-queue')
+
+    const result = await submit({ name: 'cron-queue', cron: '0 8 * *' })
+    expect(result).toEqual({ error: 'Cron expression must have 5 parts (minute hour day month weekday)' })
+  })
+
+  it('records the missed occurrence policy', async () => {
+    await createTestQueue('missed-queue')
+
+    await submit({ name: 'missed-queue', cron: '0 3 * * *', missed: 'once' })
+
+    const [stored] = await getBoss().getSchedules('missed-queue')
+    expect(stored.options?.missed).toBe('once')
+  })
+
+  it('refuses a missed policy that is neither skip nor once', async () => {
+    await createTestQueue('missed-queue')
+
+    const result = await submit({ name: 'missed-queue', cron: '0 3 * * *', missed: 'all' })
+    expect(result).toEqual({ error: 'Missed occurrence policy must be skip or once' })
   })
 })

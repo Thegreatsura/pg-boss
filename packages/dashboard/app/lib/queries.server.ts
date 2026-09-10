@@ -203,6 +203,39 @@ async function readyHistoryColumn (dbUrl: string, schema: string): Promise<strin
   return (await hasReadyHistoryColumn(dbUrl, schema)) ? ', ready_history as "readyHistory"' : ''
 }
 
+// Whether schedule.kind and schedule.last_job_id (both schema v41+) exist, cached per (db, schema)
+// like the ready_history probe above. One entry covers both columns because one migration added
+// them; a database without them reads as a table of cron schedules that have never recorded a job,
+// which is what it was before v41.
+const scheduleColumnsCache = new Map<string, boolean>()
+
+// Reset the schedule column capability cache (used by tests).
+export function clearScheduleColumnsCache (): void {
+  scheduleColumnsCache.clear()
+}
+
+async function hasScheduleKindColumns (dbUrl: string, schema: string): Promise<boolean> {
+  const key = `${dbUrl}::${schema}`
+  const cached = scheduleColumnsCache.get(key)
+  if (cached !== undefined) return cached
+
+  validateIdentifier(schema)
+  const sql = `
+    SELECT COUNT(*)::int = 2 as "exists"
+    FROM information_schema.columns
+    WHERE table_schema = $1 AND table_name = 'schedule' AND column_name IN ('kind', 'last_job_id')
+  `
+  const row = await queryOne<{ exists: boolean }>(dbUrl, sql, [schema])
+  const exists = row?.exists ?? false
+  scheduleColumnsCache.set(key, exists)
+  return exists
+}
+
+// Build the `, kind, last_job_id as "lastJobId"` SELECT fragment when the columns exist, else ''.
+async function scheduleKindColumns (dbUrl: string, schema: string): Promise<string> {
+  return (await hasScheduleKindColumns(dbUrl, schema)) ? ', kind, last_job_id as "lastJobId"' : ''
+}
+
 export async function getQueues (
   dbUrl: string,
   schema: string,
@@ -957,6 +990,7 @@ export async function getSchedules (
   const s = validateIdentifier(schema)
   const { limit, offset, sort, dir } = options
   const orderBy = buildOrderBy({ sort, dir }, SCHEDULE_SORT_COLUMNS, 'name, key', 'name, key')
+  const kindColumns = await scheduleKindColumns(dbUrl, schema)
 
   const sql = `
     SELECT
@@ -967,7 +1001,7 @@ export async function getSchedules (
       data,
       options,
       created_on as "createdOn",
-      updated_on as "updatedOn"
+      updated_on as "updatedOn"${kindColumns}
     FROM ${s}.schedule
     ${orderBy}
     ${limit !== undefined ? 'LIMIT $1 OFFSET $2' : ''}
@@ -993,6 +1027,7 @@ export async function getSchedule (
   key: string
 ): Promise<ScheduleResult | null> {
   const s = validateIdentifier(schema)
+  const kindColumns = await scheduleKindColumns(dbUrl, schema)
   const sql = `
     SELECT
       name,
@@ -1002,7 +1037,7 @@ export async function getSchedule (
       data,
       options,
       created_on as "createdOn",
-      updated_on as "updatedOn"
+      updated_on as "updatedOn"${kindColumns}
     FROM ${s}.schedule
     WHERE name = $1 AND key = $2
   `

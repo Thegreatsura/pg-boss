@@ -36,7 +36,7 @@ Every queue in the schema with its policy and cached counts (queued, deferred, r
 
 ### Schedules
 
-Schedules registered with `boss.schedule()`, showing the target queue, optional key, expression, a human-readable frequency, the next occurrence and timezone. The frequency and next occurrence are read from the expression as cron, so a schedule stored as an [RRULE](./api/scheduling.md#rrule-expressions) is listed with neither. **Schedule Job** creates a new schedule, and each schedule's detail page shows its data and options and lets you unschedule it.
+Schedules registered with `boss.schedule()`, showing the target queue, optional key, expression, a human-readable frequency, the next occurrence and timezone. Both schedule kinds are read through pg-boss itself, so a schedule stored as an [RRULE](./api/scheduling.md#rrule-expressions) is badged as one and gets the same next occurrence the scheduling pass will use. **Schedule Job** creates a new schedule from either a cron expression or a rule, with a [missed occurrence](./api/scheduling.md#catch-up-after-an-outage) policy, and each schedule's detail page shows its data, options, the last job it created and lets you unschedule it.
 
 ![Schedules page](./images/dashboard-schedules.png)
 

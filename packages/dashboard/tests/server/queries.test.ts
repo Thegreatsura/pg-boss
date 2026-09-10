@@ -35,6 +35,7 @@ import {
   getSchedules,
   getScheduleCount,
   getSchedule,
+  clearScheduleColumnsCache,
   cancelJob,
   retryJob,
   resumeJob,
@@ -1389,6 +1390,51 @@ describe('Schedule Queries', () => {
       expect(schedule!.key).toBe('my-key')
       expect(schedule!.cron).toBe('0 */2 * * *')
       expect(schedule!.timezone).toBe('America/New_York')
+    })
+
+    it('reads the kind and last job of a recurrence rule', async () => {
+      await createTestQueue('rule-schedule')
+
+      const pool = new Pool({ connectionString: ctx.connectionString })
+      const jobId = '11111111-2222-3333-4444-555555555555'
+      await pool.query(
+        `INSERT INTO ${ctx.schema}.schedule (name, key, kind, cron, timezone, data, options, last_job_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        ['rule-schedule', '', 'rrule', 'FREQ=DAILY;BYHOUR=9', 'UTC', '{}', '{}', jobId]
+      )
+      await pool.end()
+
+      const schedule = await getSchedule(ctx.connectionString, ctx.schema, 'rule-schedule', '')
+
+      expect(schedule!.kind).toBe('rrule')
+      expect(schedule!.cron).toBe('FREQ=DAILY;BYHOUR=9')
+      expect(schedule!.lastJobId).toBe(jobId)
+    })
+
+    it('leaves kind and lastJobId undefined on a database without the v41 columns', async () => {
+      await createTestQueue('old-schedule')
+
+      const pool = new Pool({ connectionString: ctx.connectionString })
+      await pool.query(
+        `INSERT INTO ${ctx.schema}.schedule (name, key, cron, timezone, data, options) VALUES ($1, $2, $3, $4, $5, $6)`,
+        ['old-schedule', '', '0 * * * *', 'UTC', '{}', '{}']
+      )
+      // What a schema older than v41 looks like to the read: the columns the pass writes are simply
+      // not there, and the query has to come back with the rest of the row rather than an error.
+      await pool.query(`ALTER TABLE ${ctx.schema}.schedule DROP COLUMN kind, DROP COLUMN last_job_id`)
+      await pool.end()
+      clearScheduleColumnsCache()
+
+      const [listed] = await getSchedules(ctx.connectionString, ctx.schema)
+      const one = await getSchedule(ctx.connectionString, ctx.schema, 'old-schedule', '')
+
+      expect(listed.cron).toBe('0 * * * *')
+      expect(listed.kind).toBeUndefined()
+      expect(listed.lastJobId).toBeUndefined()
+      expect(one!.kind).toBeUndefined()
+      expect(one!.lastJobId).toBeUndefined()
+
+      clearScheduleColumnsCache()
     })
   })
 })

@@ -5,6 +5,8 @@ import {
   PgBoss,
   events,
   policies,
+  scheduleKinds,
+  scheduleMissedPolicies,
   states,
   type ConstructorOptions
 } from 'pg-boss'
@@ -253,7 +255,7 @@ export async function createProxyService (options: ProxyOptions): Promise<ProxyS
   })
 
   app.openapi(metaRoute, (context) => {
-    return context.json({ ok: true, result: { states, policies, events } }, 200)
+    return context.json({ ok: true, result: { states, policies, events, scheduleKinds, scheduleMissedPolicies } }, 200)
   })
 
   const registerRoute = (entry: RouteEntry) => {

@@ -1,4 +1,5 @@
 import type * as types from './types.js'
+import { scheduleKinds, scheduleMissedPolicies } from 'pg-boss'
 import { z } from 'zod'
 
 // ============== Base Types ==============
@@ -85,13 +86,12 @@ export const updateOptionsSchema = z.object({
   match: z.enum(['newest', 'oldest', 'all']).optional(),
 }) satisfies z.ZodType<types.HttpUpdateOptions>
 
-// missed is spelled out rather than derived from the core's exported scheduleMissedPolicies: the
-// proxy builds against a published pg-boss, and the constant is only public from 12.31.0. It moves
-// to the export at the next dependency bump, as the kind enum below does.
+// missed and the kind enum below both come from the core's own exported constants, so a policy or
+// kind added there widens the contract (and the generated OpenAPI enum) without an edit here.
 export const scheduleOptionsSchema = sendOptionsSchemaBase.extend({
   tz: z.string().optional(),
   key: z.string().optional(),
-  missed: z.enum(['skip', 'once']).optional(),
+  missed: z.enum(scheduleMissedPolicies).optional(),
 }) satisfies z.ZodType<types.HttpScheduleOptions>
 
 export const fetchOptionsSchema = z.object({
@@ -249,7 +249,7 @@ export const queueResultSchema = z.object({
 export const scheduleSchema = z.object({
   name: z.string(),
   key: z.string(),
-  kind: z.enum(['cron', 'rrule']),
+  kind: z.enum(scheduleKinds),
   cron: z.string(),
   timezone: z.string(),
   data: jsonRecordSchema.optional(),
@@ -272,7 +272,11 @@ export const bamStatusSummarySchema = z.object({
 export const metaResultSchema: z.ZodType<types.HttpMetaResult> = z.object({
   states: z.record(z.string(), z.string()),
   policies: z.record(z.string(), z.string()),
-  events: z.record(z.string(), z.string())
+  events: z.record(z.string(), z.string()),
+  // The schedule enumerations joined the meta payload with the 12.31 schedule work, so a client can
+  // populate a kind or missed-policy selector from the running core instead of hardcoding both.
+  scheduleKinds: z.record(z.string(), z.string()),
+  scheduleMissedPolicies: z.record(z.string(), z.string())
 })
 
 export const metaResponseSchema: z.ZodType<types.HttpMetaResponse> = z.object({

@@ -3,7 +3,7 @@ import { DbLink } from '~/components/db-link'
 import type { Route } from './+types/schedules.$name.$key'
 import { useReadOnly } from '~/lib/read-only'
 import { getSchedule } from '~/lib/queries.server'
-import { nextCronOccurrence } from '~/lib/cron.server'
+import { nextScheduleOccurrence } from '~/lib/schedule.server'
 import { unschedule } from '~/lib/boss.server'
 import { dbContext } from '~/lib/db-context'
 import { Card, CardHeader, CardTitle, CardContent } from '~/components/ui/card'
@@ -31,7 +31,7 @@ export async function loader ({ params, context }: Route.LoaderArgs) {
     throw new Response('Schedule not found', { status: 404 })
   }
 
-  const next = nextCronOccurrence(schedule.cron, schedule.timezone)
+  const next = nextScheduleOccurrence(schedule.cron, schedule.timezone)
   return { schedule, nextOccurrence: next ? next.toISOString() : null }
 }
 
@@ -133,12 +133,30 @@ export default function ScheduleDetail ({ loaderData, actionData }: Route.Compon
             </div>
 
             <div>
-              <dt className="pgb-eyebrow">Cron Expression</dt>
+              <dt className="pgb-eyebrow">{schedule.kind === 'rrule' ? 'Recurrence Rule' : 'Cron Expression'}</dt>
               <dd className="mt-1 flex items-center gap-2">
-                <code className="text-sm bg-gray-100 dark:bg-gray-800 px-2 py-1 rounded text-gray-700 dark:text-gray-300">
+                <code className="text-sm bg-gray-100 dark:bg-gray-800 px-2 py-1 rounded text-gray-700 dark:text-gray-300 whitespace-pre-wrap break-all">
                   {schedule.cron}
                 </code>
                 <Badge variant="gray" size="sm">{schedule.timezone || 'UTC'}</Badge>
+              </dd>
+            </div>
+
+            <div>
+              <dt className="pgb-eyebrow">Last job</dt>
+              <dd className="mt-1 text-sm text-gray-900 dark:text-gray-100">
+                {schedule.lastJobId ? (
+                  <DbLink
+                    to={`/queues/${encodeURIComponent(schedule.name)}/jobs/${encodeURIComponent(schedule.lastJobId)}`}
+                    className="font-mono text-xs text-primary-600 hover:text-primary-700 dark:text-primary-400 dark:hover:text-primary-300"
+                  >
+                    {schedule.lastJobId}
+                  </DbLink>
+                ) : (
+                  // Null both before the schedule has ever fired and on a database older than
+                  // schema v41, where the column the pass writes does not exist yet.
+                  <span className="text-gray-400 dark:text-gray-500">—</span>
+                )}
               </dd>
             </div>
 

@@ -6,7 +6,7 @@ import {
   getSchedules,
   getScheduleCount,
 } from '~/lib/queries.server'
-import { nextCronOccurrence } from '~/lib/cron.server'
+import { nextScheduleOccurrence } from '~/lib/schedule.server'
 import { Card, CardHeader, CardTitle, CardContent } from '~/components/ui/card'
 import { PageHeader } from '~/components/ui/page-header'
 import { Badge } from '~/components/ui/badge'
@@ -23,6 +23,7 @@ import {
 import { Pagination } from '~/components/ui/pagination'
 import { ErrorCard } from '~/components/error-card'
 import { dbContext } from '~/lib/db-context'
+import type { ScheduleKind } from '~/lib/types'
 import {
   parsePageNumber,
   formatDate,
@@ -43,9 +44,10 @@ export async function loader ({ request, context }: Route.LoaderArgs) {
     getScheduleCount(DB_URL, SCHEMA),
   ])
 
-  // Derive each schedule's next fire time from its cron + timezone (null if the cron is unparseable).
+  // Derive each schedule's next fire time from its expression + timezone (null when the expression
+  // parses as neither kind, or when a finite rule has nothing left to send).
   const schedulesWithNext = schedules.map((schedule) => {
-    const next = nextCronOccurrence(schedule.cron, schedule.timezone)
+    const next = nextScheduleOccurrence(schedule.cron, schedule.timezone)
     return { ...schedule, nextOccurrence: next ? next.toISOString() : null }
   })
 
@@ -109,6 +111,14 @@ export function cronHuman (cron: string): string {
   return 'Custom schedule'
 }
 
+// What the Frequency column says for a row. Cron expressions get a described pattern; a recurrence
+// rule is only labelled, since the parts a rule can carry (several BYHOUR values, an UNTIL, an
+// interval) turn any short phrase into an understatement of when it actually fires. The expression
+// itself is in the column beside it either way.
+export function scheduleHuman (expression: string, kind?: ScheduleKind): string {
+  return kind === 'rrule' ? 'Recurrence rule' : cronHuman(expression)
+}
+
 export default function Schedules ({ loaderData }: Route.ComponentProps) {
   const readOnly = useReadOnly()
   const { schedules, totalCount, page, totalPages, hasNextPage, hasPrevPage } = loaderData
@@ -124,7 +134,7 @@ export default function Schedules ({ loaderData }: Route.ComponentProps) {
     <div className="space-y-4">
       <PageHeader
         title="Schedules"
-        subtitle="Cron-based jobs queued automatically by pg-boss"
+        subtitle="Jobs queued automatically by pg-boss, on a cron expression or a recurrence rule"
         action={readOnly ? undefined : (
           <DbLink to="/schedules/new">
             <Button variant="primary" size="md" className='cursor-pointer'>Schedule Job</Button>
@@ -147,7 +157,7 @@ export default function Schedules ({ loaderData }: Route.ComponentProps) {
               <TableRow>
                 <SortableHeader column="name">Queue</SortableHeader>
                 <SortableHeader column="key">Key</SortableHeader>
-                <SortableHeader column="cron">Cron</SortableHeader>
+                <SortableHeader column="cron">Expression</SortableHeader>
                 <TableHead>Frequency</TableHead>
                 <TableHead>Next occurrence</TableHead>
                 <SortableHeader column="timezone">Timezone</SortableHeader>
@@ -182,10 +192,13 @@ export default function Schedules ({ loaderData }: Route.ComponentProps) {
                         {schedule.key}
                       </TableCell>
                       <TableCell className="pgb-num text-[var(--text-primary)]">
-                        {schedule.cron}
+                        <span className="flex items-center gap-2">
+                          <span className="truncate max-w-[22rem]" title={schedule.cron}>{schedule.cron}</span>
+                          {schedule.kind === 'rrule' && <Badge variant="gray" size="sm">rrule</Badge>}
+                        </span>
                       </TableCell>
                       <TableCell className="text-[var(--text-secondary)]">
-                        {cronHuman(schedule.cron)}
+                        {scheduleHuman(schedule.cron, schedule.kind)}
                       </TableCell>
                       <TableCell className="text-[var(--text-secondary)]">
                         {schedule.nextOccurrence ? (
