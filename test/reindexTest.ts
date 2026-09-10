@@ -5,6 +5,7 @@ import { PgBoss, getIndexBloatPlans } from '../src/index.ts'
 import pg from 'pg'
 import type { IDatabase, Warning } from '../src/types.ts'
 import { delay } from '../src/tools.ts'
+import { isDistributedBackend, distributedTimeout } from './timeouts.ts'
 
 // Enough rows that job_common_i11 and job_common_pkey both clear the 128-page (1 MB) floor once the
 // rows are deleted: the heap truncates, the btrees keep every page they grew.
@@ -67,7 +68,18 @@ async function collectWarnings (schema: string, type: string) {
   }
 }
 
-helper.describePostgresOnly('reindex', function () {
+// Every test here fills a job table with BLOAT_ROWS rows, drains it, vacuums it and then rebuilds
+// real indexes, which is 1.5-3.5s of database work on an idle machine against a 10s global budget.
+// That headroom disappears on a loaded one - the suite runs its files in parallel against one
+// server, and autovacuum runs over every schema the run has left behind - so the heaviest tests in
+// the file time out intermittently rather than fail. Raise the budget for the block.
+//
+// Lifting only, per the rule in test/timeouts.ts: a block value replaces the global in both
+// directions, and this suite still runs on YugabyteDB, where a flat 30s would cap the budget that
+// backend is given at a quarter.
+const blockTimeout = isDistributedBackend ? distributedTimeout : 30000
+
+helper.describePostgresOnly('reindex', { timeout: blockTimeout }, function () {
   it('finds no bloat on a fresh installation', async function () {
     const boss = ctx.boss = await helper.start({ ...ctx.bossConfig, noDefault: true, supervise: false })
     await boss.createQueue('quiet')
@@ -709,20 +721,43 @@ helper.describePostgresOnly('reindex', function () {
       await holder.query(`SELECT 1 FROM ${ctx.schema}.job_common LIMIT 1`)
 
       await builder.connect()
-      const building = builder.query(`REINDEX INDEX CONCURRENTLY ${ctx.schema}.job_common_pkey`)
 
+      // The rejection is captured rather than awaited: a build that fails outright never reaches
+      // the wait phase, and the reason it failed belongs in this test's failure rather than in a
+      // timeout ten seconds later.
+      const build: { error: Error | null } = { error: null }
+      const building = builder.query(`REINDEX INDEX CONCURRENTLY ${ctx.schema}.job_common_pkey`)
+        .catch((err: Error) => { build.error = err })
+
+      // Polled on an interval with a deadline, not spun on. A tight loop of catalog reads competes
+      // for the pool and the CPU with the build it is waiting for, and a build that never registers
+      // - it failed, or it finished before the first read - would spin until the test budget ran
+      // out, reporting a timeout in place of the reason.
+      const deadline = Date.now() + 10_000
       let live = 0
 
       while (!live) {
         const { rows } = await db.executeSql(
           `SELECT count(*)::int as count FROM pg_stat_progress_create_index WHERE relid = '${ctx.schema}.job_common'::regclass`)
         live = rows[0].count
+
+        if (live) break
+
+        if (build.error) throw build.error
+
+        if (Date.now() > deadline) {
+          throw new Error('the rebuild never registered in pg_stat_progress_create_index')
+        }
+
+        await delay(25)
       }
 
       expect(await boss.getReindexCommands()).not.toContain(drop)
 
       await holder.query('COMMIT')
       await building
+
+      expect(build.error).toBeNull()
 
       // Once nothing is building, the same stub is a leftover again.
       expect(await boss.getReindexCommands()).toContain(drop)

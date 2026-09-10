@@ -545,6 +545,47 @@ describe('timekeeper clock domain', function () {
     expect(tk.clockSkew).toBe(good)
   })
 
+  it('names the direction a skewed database clock runs in', async function () {
+    // The warning tells an operator which of the two machines to look at, so the sign of the skew
+    // has to survive into the message: a database clock behind the local one is slower, ahead of it
+    // faster. Forced rather than waited for, since the threshold is a full minute of real skew.
+    const directions: string[] = []
+
+    for (const offset of [90_000, -90_000]) {
+      const tk = makeTk(offset, { __test__force_clock_skew_warning: true })
+
+      tk.on('warning', (warning: any) => directions.push(warning.data.direction))
+
+      await tk.cacheClockSkew()
+    }
+
+    expect(directions).toEqual(['slower', 'faster'])
+  })
+
+  it('stops cleanly when neither monitor was ever started', async function () {
+    // stop() on an instance that never reached start(), which is what a failed boot unwinds
+    // through: there is no interval to clear and nothing to throw over.
+    const tk = makeTk(0, {}, { offWork: async () => {} })
+
+    // An instance starts life stopped, so the flag has to be cleared for stop() to do any work at
+    // all rather than take its already-stopped early return.
+    ;(tk as any).stopped = false
+
+    await tk.stop()
+
+    expect((tk as any).stopped).toBe(true)
+  })
+
+  it('reports a schedule write that failed for a reason other than a missing queue', async function () {
+    // The foreign key is rewritten into "Queue not found" because that is the one failure a caller
+    // causes; anything else is the database's own message and is handed back untouched.
+    const tk = makeTk(0)
+
+    ;(tk.db as any).executeSql = async () => { throw new Error('deadlock detected') }
+
+    await expect(tk.schedule('q', '0 3 * * *', null, {})).rejects.toThrow('deadlock detected')
+  })
+
   it('shouldSendIt fires within the window even when the database clock is far ahead', function () {
     const tk = makeTk(0)
     tk.clockSkew = 120_000 // db 2 minutes ahead of local

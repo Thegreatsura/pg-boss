@@ -374,6 +374,36 @@ export interface MigrationPartition {
   policy: QueuePolicy
 }
 
+export interface PlanOptions {
+  /**
+   * The backend the SQL is meant to run against, named the way the constructor names it. Exported
+   * SQL is run by hand, so it has to be the SQL that engine accepts: without this, plans are stock
+   * PostgreSQL and a distributed backend rejects them partway through — table partitioning,
+   * advisory locks, covering indexes, a column written in the transaction that added it.
+   * `pglite` is stock PostgreSQL and needs nothing here.
+   * @default 'postgres'
+   */
+  backend?: BackendProfile;
+}
+
+export interface ConstructionPlanOptions extends PlanOptions {
+  /**
+   * Include `CREATE SCHEMA`. Turn it off where the schema already exists or is created by
+   * something else.
+   * @default true
+   */
+  createSchema?: boolean;
+}
+
+export interface MigrationPlanOptions extends PlanOptions {
+  /**
+   * The partitioned job tables the migration should fan its index builds out across, as
+   * `getQueues()` reports them. Only a caller holding a live connection can enumerate these;
+   * without them a migration builds indexes on the shared table alone.
+   */
+  partitionTables?: MigrationPartition[];
+}
+
 export interface ConstructorOptions extends DatabaseOptions, SchedulingOptions, MaintenanceOptions, BackendOptions {
   /**
    * Enables the LISTEN/NOTIFY listener so workers on notify-enabled queues are woken

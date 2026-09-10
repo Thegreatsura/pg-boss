@@ -217,6 +217,72 @@ describe('migration', function () {
     expect(plans).toBeTruthy()
   })
 
+  it('shapes every exported plan for the backend it names', function () {
+    // Exported SQL is run by hand, against whatever engine the caller has: the same three functions
+    // the CLI wraps, which takes --backend for exactly this reason. Stock PostgreSQL stays the
+    // default, so a caller that names nothing gets what it always got.
+    const schema = 'custom'
+    const from = currentSchemaVersion - 2
+
+    const stock = {
+      construction: getConstructionPlans(schema),
+      migration: getMigrationPlans(schema, from),
+      rollback: getRollbackPlans(schema, currentSchemaVersion)
+    }
+
+    const distributed = {
+      construction: getConstructionPlans(schema, { backend: 'cockroachdb' }),
+      migration: getMigrationPlans(schema, from, { backend: 'cockroachdb' }),
+      rollback: getRollbackPlans(schema, currentSchemaVersion, { backend: 'cockroachdb' })
+    }
+
+    // The advisory lock wraps all three, so it is the one gate every plan can be checked against.
+    for (const kind of ['construction', 'migration', 'rollback'] as const) {
+      expect(stock[kind], kind).toContain('pg_advisory_xact_lock')
+      expect(distributed[kind], kind).not.toContain('pg_advisory_xact_lock')
+    }
+
+    // The schema choices CockroachDB rejects outright.
+    expect(stock.construction).toMatch(/PARTITION BY/)
+    expect(distributed.construction).not.toMatch(/PARTITION BY|ATTACH PARTITION|INCLUDE \(|DEFERRABLE/)
+
+    // And the seeds noAddColumnBackfill drops, found the same way the gate's own tests find them
+    // rather than by naming a version.
+    const squash = (sql: string) => sql.replace(/\s+/g, ' ')
+    const dropped = getAll(schema).flatMap(sameTransactionBackfills)
+
+    expect(dropped.length).toBeGreaterThan(0)
+
+    for (const statement of dropped) {
+      expect(squash(stock.migration)).toContain(squash(statement))
+      expect(squash(distributed.migration)).not.toContain(squash(statement))
+    }
+  })
+
+  it('keeps the other plan options working alongside a backend', function () {
+    // backend is an addition to these signatures, not a replacement: what each function already
+    // took has to keep working, with or without one.
+    expect(getConstructionPlans('custom', { createSchema: false })).not.toContain('CREATE SCHEMA')
+    expect(getConstructionPlans('custom', { createSchema: false, backend: 'cockroachdb' })).not.toContain('CREATE SCHEMA')
+    expect(getConstructionPlans('custom', { backend: 'cockroachdb' })).toContain('CREATE SCHEMA')
+
+    // A backend nobody has a profile for is rejected where it is named, not carried into the SQL.
+    // @ts-expect-error deliberately naming a backend that is not a profile
+    expect(() => getMigrationPlans('custom', currentSchemaVersion - 1, { backend: 'mysql' })).toThrow(/backend must be one of/)
+  })
+
+  it('exports plans for a backend that keeps some of the postgres schema choices', function () {
+    // Not every distributed engine drops the same things: YugabyteDB runs the standard fetch path
+    // and keeps covering indexes and deferrable constraints, and only loses advisory locks and
+    // table partitioning. A single "distributed" switch here would have taken all four.
+    const yugabyte = getConstructionPlans('custom', { backend: 'yugabytedb' })
+
+    expect(yugabyte).not.toContain('pg_advisory_xact_lock')
+    expect(yugabyte).not.toMatch(/PARTITION BY/)
+    expect(yugabyte).toMatch(/INCLUDE \(/)
+    expect(yugabyte).toMatch(/DEFERRABLE/)
+  })
+
   it('should not migrate when current version is not found in migration store', async function () {
     const config = { ...ctx.bossConfig }
 

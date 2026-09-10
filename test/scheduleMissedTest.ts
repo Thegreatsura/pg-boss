@@ -49,7 +49,7 @@ function ical (epochMs: number) {
  * A pass over `schedules` with the database clock at `databaseTime` and the last pass at
  * `priorCronOn`, answering with the jobs it forwarded.
  */
-async function pass (tk: ReturnType<typeof makeTk>, databaseTime: number, priorCronOn: Date | null, schedules: unknown[]) {
+async function pass (tk: ReturnType<typeof makeTk>, databaseTime: number, priorCronOn: unknown, schedules: unknown[]) {
   const inserted: any[] = []
 
   ;(tk as any).stopped = false
@@ -80,6 +80,11 @@ function row (cron: string, missed?: string, extra: Record<string, unknown> = {}
 /** The slots a pass filed catch-up jobs in, which is every job it filed bar the due cron one. */
 function slots (inserted: any[]) {
   return inserted.filter(job => job.__singletonSlot !== undefined).map(job => job.__singletonSlot)
+}
+
+/** The jobs a pass filed for the due window off a cron row, which name no slot of their own. */
+function due (inserted: any[]) {
+  return inserted.filter(job => job.__singletonSlot === undefined)
 }
 
 async function waitForJobs (boss: PgBoss, count: number): Promise<Job[]> {
@@ -265,6 +270,69 @@ describe('schedule missed', function () {
     const inserted = await pass(tk, now, new Date(now - 10 * MINUTE), [row('* * * * *', 'all')])
 
     expect(slots(inserted)).toEqual([])
+  })
+
+  it('reads a last pass and a creation time in every shape a driver hands one back', async function () {
+    const minute = Math.floor(Date.now() / MINUTE) * MINUTE
+    const now = minute + 30_000
+    const lastPass = now - 10 * MINUTE
+
+    // node-postgres parses a timestamp column into a Date, and an adapter over a backend that
+    // speaks JSON hands back the string or the epoch it was sent. All three name the same instant,
+    // so a catch-up owes the same occurrence whichever one the pass is holding.
+    const shapes: unknown[] = [
+      new Date(lastPass),
+      new Date(lastPass).toISOString(),
+      lastPass
+    ]
+
+    for (const priorCronOn of shapes) {
+      const inserted = await pass(makeTk(), now, priorCronOn, [
+        // A created_on in the string shape too, and older than the gap, so the bound it puts under
+        // the read is the last pass rather than the row.
+        row('* * * * *', 'once', { createdOn: new Date(lastPass - DAY).toISOString() })
+      ])
+
+      expect(slots(inserted)).toEqual([slotOf(minute - MINUTE)])
+    }
+  })
+
+  it('reads a last pass it cannot make an instant of as no last pass at all', async function () {
+    const minute = Math.floor(Date.now() / MINUTE) * MINUTE
+    const now = minute + 30_000
+
+    // Neither a timestamp nor anything that parses as one: an absent column, and a column holding
+    // something a pass has no reading of. No last pass means no gap, so the pass sends the due
+    // window and nothing else, which is what every release before catch-up sent.
+    for (const priorCronOn of [null, undefined, 'not a timestamp', new Date('not a timestamp'), {}]) {
+      const inserted = await pass(makeTk(), now, priorCronOn, [row('* * * * *', 'once')])
+
+      expect(slots(inserted)).toEqual([])
+      expect(due(inserted)).toHaveLength(1)
+    }
+  })
+
+  it('sends the due occurrence and warns when the catch-up read fails on its own', async function () {
+    const tk = makeTk()
+
+    const minute = Math.floor(Date.now() / MINUTE) * MINUTE
+    const now = minute + 30_000
+
+    const warnings: any[] = []
+    tk.on('warning', warning => warnings.push(warning))
+
+    // The two reads are hard to make diverge on an expression, since one that cannot be read
+    // backwards is refused by the due read first and the whole row is skipped. They stay in
+    // separate trys anyway, so the failure is injected on the backwards read alone: the occurrence
+    // that is due now is still sent, and the gap is reported rather than retried.
+    ;(tk as any).latestOccurrenceBefore = () => { throw new Error('unreadable backwards') }
+
+    const inserted = await pass(tk, now, new Date(now - 10 * MINUTE), [row('* * * * *', 'once')])
+
+    expect(slots(inserted)).toEqual([])
+    expect(due(inserted)).toHaveLength(1)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0].message).toMatch(/could not be caught up on the gap since the last cron pass: unreadable backwards/)
   })
 
   it('files a missed occurrence and a due one that share a slot as one job', async function () {

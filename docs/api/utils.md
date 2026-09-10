@@ -6,10 +6,13 @@ The following functions are exported from the package and are not required durin
 import { getConstructionPlans, getMigrationPlans, getRollbackPlans, getIndexBloatPlans } from 'pg-boss'
 ```
 
-### `getConstructionPlans(schema)`
+All three plan functions take an optional `backend`, which names the engine the SQL is meant to run against — the same profile the [constructor](../database-backends.md) takes, and the same one [`pg-boss migrate --backend`](../cli.md#backends) takes. Without it plans are stock PostgreSQL, which a distributed engine rejects partway through: table partitioning, advisory locks, covering indexes, a column written in the transaction that added it. `postgres` is the default, and `pglite` needs nothing here since it is stock PostgreSQL.
+
+### `getConstructionPlans(schema, options)`
 
 **Arguments**
 - `schema`: string, database schema name
+- `options`: object, optional. Accepts `createSchema` (default `true`) and `backend`.
 
 Returns the SQL commands required for manual creation of the required schema.
 
@@ -18,13 +21,17 @@ const sql = getConstructionPlans('pgboss')
 
 // hand the DDL to a migration tool or a privileged operator
 fs.writeFileSync('create-pgboss.sql', sql)
+
+// the same schema, as CockroachDB accepts it
+const crdb = getConstructionPlans('pgboss', { backend: 'cockroachdb' })
 ```
 
-### `getMigrationPlans(schema, version)`
+### `getMigrationPlans(schema, version, options)`
 
 **Arguments**
 - `schema`: string, database schema name
 - `version`: int, current schema version to migrate from
+- `options`: object, optional. Accepts `partitionTables` and `backend`.
 
 Returns the SQL commands required to manually migrate from the specified version to the latest version.
 
@@ -34,11 +41,12 @@ Returns the SQL commands required to manually migrate from the specified version
 const sql = getMigrationPlans('pgboss', 35)
 ```
 
-### `getRollbackPlans(schema, version)`
+### `getRollbackPlans(schema, version, options)`
 
 **Arguments**
 - `schema`: string, database schema name
 - `version`: int, target schema version to uninstall
+- `options`: object, optional. Accepts `backend`.
 
 Returns the SQL commands required to manually roll back the specified version to the previous version
 

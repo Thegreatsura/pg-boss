@@ -28,11 +28,11 @@ export const events: types.Events = Object.freeze({
   flow: 'flow'
 })
 
-export function getConstructionPlans (schema?: string) {
-  return Contractor.constructionPlans(schema)
+export function getConstructionPlans (schema?: string, options?: types.ConstructionPlanOptions) {
+  return Contractor.constructionPlans(schema, options)
 }
 
-export function getMigrationPlans (schema?: string, version?: number, options?: { partitionTables?: types.MigrationPartition[] }) {
+export function getMigrationPlans (schema?: string, version?: number, options?: types.MigrationPlanOptions) {
   return Contractor.migrationPlans(schema, version, options)
 }
 
@@ -45,8 +45,8 @@ export function getIndexBloatPlans (schema?: string, options?: types.IndexBloatO
   return plans.getBloatedIndexes(schema || plans.DEFAULT_SCHEMA, undefined, options)
 }
 
-export function getRollbackPlans (schema?: string, version?: number) {
-  return Contractor.rollbackPlans(schema, version)
+export function getRollbackPlans (schema?: string, version?: number, options?: types.PlanOptions) {
+  return Contractor.rollbackPlans(schema, version, options)
 }
 
 export class PgBoss extends EventEmitter<types.PgBossEventMap> {
