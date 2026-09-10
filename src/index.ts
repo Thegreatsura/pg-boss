@@ -637,6 +637,7 @@ export {
   fromDrizzle,
   fromPrisma,
   fromPglite,
+  fromBunSql,
 } from './adapters/index.ts'
 
 export type {
@@ -646,4 +647,6 @@ export type {
   DrizzleSqlTagLike,
   PrismaTransactionLike,
   PGliteLike,
+  BunSqlLike,
+  BunReservedSqlLike,
 } from './adapters/index.ts'

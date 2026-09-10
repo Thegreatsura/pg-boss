@@ -38,7 +38,7 @@ await db.transaction().execute(async (trx) => {
 
 ## Drizzle
 
-The Drizzle adapter requires the `sql` tagged-template function from `drizzle-orm` as a second argument. This allows pg-boss to construct parameterised queries through Drizzle's public API without adding `drizzle-orm` as a runtime dependency. Both the `node-postgres` and `postgres-js` drivers are supported.
+The Drizzle adapter requires the `sql` tagged-template function from `drizzle-orm` as a second argument. This allows pg-boss to construct parameterised queries through Drizzle's public API without adding `drizzle-orm` as a runtime dependency. The `node-postgres`, `postgres-js` and `bun-sql` drivers are supported — for `bun-sql`, see [Bun](../database-backends.md#bun-driver), which covers running pg-boss on Bun's client as well as enqueueing through it.
 
 ```ts
 import { fromDrizzle } from 'pg-boss'

@@ -13,5 +13,9 @@
     "noEmit": true,
     "rootDir": "./",
   },
-  "include": ["src", "test"]
+  // test/bun imports `bun` and `bun:test` and reaches for Bun globals, so it needs @types/bun in
+  // scope - which would then also be in scope for src and the vitest suite. It is checked by
+  // tsconfig.bun.json instead, run as the first half of `npm run test:bun`.
+  "include": ["src", "test"],
+  "exclude": ["test/bun"]
 }

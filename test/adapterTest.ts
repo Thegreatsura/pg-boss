@@ -353,6 +353,27 @@ describe('drizzle adapter', () => {
     expect(result.rows[0]?.multi).toBe(true)
   })
 
+  it('should handle empty and awkward array parameters (drizzle)', async () => {
+    ctx.boss = await helper.start(ctx.bossConfig)
+    if (!pool) pool = new pg.Pool({ connectionString: connString })
+    const db = drizzle({ client: pool })
+
+    // the array is expanded into ARRAY[...] of scalar parameters, so an element that would need
+    // escaping in an array literal never reaches the SQL text
+    const names = ["it's", 'a,b', '{x}', 'back\\slash']
+
+    const result = await db.transaction(async (tx) => {
+      const adapter = fromDrizzle(tx, drizzleSql)
+      return adapter.executeSql(
+        'SELECT $1::text[] as names, cardinality($2::uuid[]) as empty',
+        [names, []]
+      )
+    })
+
+    expect(result.rows[0]?.names).toStrictEqual(names)
+    expect(Number(result.rows[0]?.empty)).toBe(0)
+  })
+
   it('should handle results as an array instead of object (drizzle)', async () => {
     ctx.boss = await helper.start(ctx.bossConfig)
     if (!pool) pool = new pg.Pool({ connectionString: connString })
@@ -469,6 +490,24 @@ describe('drizzle adapter (postgres-js)', () => {
 
     expect(result.rows[0]?.single).toBe(true)
     expect(result.rows[0]?.multi).toBe(true)
+  })
+
+  it('should handle empty and awkward array parameters (postgres-js)', async () => {
+    ctx.boss = await helper.start(ctx.bossConfig)
+    const db = getDb()
+
+    const names = ["it's", 'a,b', '{x}', 'back\\slash']
+
+    const result = await db.transaction(async (tx) => {
+      const adapter = fromDrizzle(tx, drizzleSql)
+      return adapter.executeSql(
+        'SELECT $1::text[] as names, cardinality($2::uuid[]) as empty',
+        [names, []]
+      )
+    })
+
+    expect(result.rows[0]?.names).toStrictEqual(names)
+    expect(Number(result.rows[0]?.empty)).toBe(0)
   })
 })
 
